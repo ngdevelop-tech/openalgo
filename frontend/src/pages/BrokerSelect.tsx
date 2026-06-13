@@ -1,5 +1,6 @@
 import { BookOpen, ExternalLink, Info, Loader2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -74,12 +75,21 @@ function generateRandomState(): string {
 }
 
 export default function BrokerSelect() {
-  const { user } = useAuthStore()
+  const { user, setUser, setApiKey } = useAuthStore()
+  const navigate = useNavigate()
   const [selectedBroker, setSelectedBroker] = useState<string>('')
   const [isLoading, setIsLoading] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [brokerConfig, setBrokerConfig] = useState<BrokerConfig | null>(null)
+
+  // If Zustand store already knows the broker is connected (e.g. AuthSync resolved
+  // the session before this component mounted), redirect immediately.
+  useEffect(() => {
+    if (user?.isLoggedIn && user?.broker) {
+      navigate('/dashboard', { replace: true })
+    }
+  }, [user, navigate])
 
   useEffect(() => {
     // Fetch broker configuration
@@ -106,6 +116,40 @@ export default function BrokerSelect() {
 
     fetchBrokerConfig()
   }, [])
+
+  // Poll session-status every 3s to detect when a token is injected externally
+  // (e.g. NQE completes Zerodha OAuth and pushes the token via inject_token API).
+  // When the session becomes active, navigate straight to the dashboard.
+  useEffect(() => {
+    let attempts = 0
+    const MAX_ATTEMPTS = 40 // stop after 2 minutes
+    const interval = setInterval(async () => {
+      attempts++
+      if (attempts > MAX_ATTEMPTS) {
+        clearInterval(interval)
+        return
+      }
+      try {
+        const res = await fetch('/auth/session-status', { credentials: 'include' })
+        if (!res.ok) return
+        const data = await res.json()
+        if (data.logged_in && data.broker) {
+          clearInterval(interval)
+          setUser({
+            username: data.user,
+            broker: data.broker,
+            isLoggedIn: true,
+            loginTime: new Date().toISOString(),
+          })
+          if (data.api_key) setApiKey(data.api_key)
+          navigate('/dashboard', { replace: true })
+        }
+      } catch {
+        // ignore transient errors
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [setUser, setApiKey, navigate])
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
