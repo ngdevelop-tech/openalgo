@@ -41,11 +41,8 @@ class InjectToken(Resource):
             user_id = verify_api_key(api_key)
             if not user_id:
                 return make_response(jsonify({"status": "error", "message": "Invalid API key"}), 403)
-            from database.user_db import User
-            user = User.query.filter_by(id=user_id).first()
-            if not user:
-                return make_response(jsonify({"status": "error", "message": "User not found"}), 403)
-            username = user.username
+            # user_id here is the username string (api_keys.user_id stores username, not numeric id)
+            username = user_id
 
             broker_api_key = os.getenv("BROKER_API_KEY", "")
             # Zerodha stores the token as "api_key:access_token"

@@ -950,6 +950,26 @@ def get_session_status():
             }
         )
 
+    # Auto-resume broker session if a token was externally injected (e.g. by NQE
+    # via inject_token) while this browser session was already open. Handles the
+    # case where the user is waiting on the /broker page after NQE completes OAuth.
+    resumed = _try_resume_broker_session(session["user"])
+    if resumed is not None:
+        from database.auth_db import get_active_sessions, get_api_key_for_tradingview
+        api_key = get_api_key_for_tradingview(session.get("user"))
+        active_count = len(get_active_sessions(session.get("user")))
+        return jsonify(
+            {
+                "status": "success",
+                "authenticated": True,
+                "logged_in": True,
+                "user": session.get("user"),
+                "broker": session.get("broker"),
+                "api_key": api_key,
+                "active_sessions": active_count,
+            }
+        )
+
     # Include active session count
     from database.auth_db import get_active_sessions
     active_count = len(get_active_sessions(session.get("user")))
