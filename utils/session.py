@@ -214,8 +214,16 @@ def check_session_validity(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not is_session_valid():
-            # Revoke tokens before clearing session
-            revoke_user_tokens()
+            # Only revoke the DB broker token for a session that actually
+            # completed broker login and has now genuinely expired — matching
+            # the guard in app.py's global before_request (see #1419). Without
+            # this, a session still mid broker-connect (logged_in never set)
+            # trips revoke_user_tokens() on any protected-route hit, which
+            # discards a broker token injected out-of-band (e.g. NQE pushing a
+            # fresh Kite token) moments earlier — the user never leaves the
+            # "connect your broker" loop even after a fresh Kite relogin.
+            if session.get("logged_in"):
+                revoke_user_tokens()
             session.clear()
 
             # Check if this is an AJAX/fetch request
@@ -255,8 +263,12 @@ def invalidate_session_if_invalid(f):
     def decorated_function(*args, **kwargs):
         if not is_session_valid():
             logger.info("Invalid session detected - clearing session")
-            # Revoke tokens before clearing session
-            revoke_user_tokens()
+            # Same guard as check_session_validity — see #1419 / the OpenAlgo
+            # login-loop RCA (2026-08-22): only revoke the DB broker token for
+            # a session that actually completed broker login and has now
+            # genuinely expired, not one still mid broker-connect.
+            if session.get("logged_in"):
+                revoke_user_tokens()
             session.clear()
         return f(*args, **kwargs)
 
