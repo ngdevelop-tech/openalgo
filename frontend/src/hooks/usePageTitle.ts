@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation } from 'react-router'
 
 const PAGE_TITLES: Record<string, string> = {
   '/': 'Home',
@@ -30,6 +30,8 @@ const PAGE_TITLES: Record<string, string> = {
   '/optionchain': 'Option Chain',
   '/ivchart': 'IV Chart',
   '/oitracker': 'OI Tracker',
+  '/oirange': 'OI Range',
+  '/gammadensity': 'Gamma Density',
   '/maxpain': 'Max Pain',
   '/straddle': 'Straddle Chart',
   '/straddlepnl': 'Straddle P&L',
@@ -38,11 +40,12 @@ const PAGE_TITLES: Record<string, string> = {
   '/ivsmile': 'IV Smile',
   '/oiprofile': 'OI Profile',
   '/websocket/test': 'WebSocket Test',
-  '/strategy': 'Strategies',
-  '/strategy/new': 'New Strategy',
+  '/websocket/order': 'Order Stream',
   '/python': 'Python Strategies',
   '/python/new': 'New Python Strategy',
   '/python/guide': 'Python Strategy Guide',
+  '/strategy': 'Strategies',
+  '/strategy/new': 'New Strategy',
   '/chartink': 'Chartink Strategies',
   '/chartink/new': 'New Chartink Strategy',
   '/flow': 'Flow',
@@ -73,11 +76,11 @@ const PAGE_TITLES: Record<string, string> = {
 
 /** Dynamic route patterns for parameterized routes */
 const DYNAMIC_TITLES: Array<{ pattern: RegExp; title: string }> = [
-  { pattern: /^\/strategy\/[^/]+\/configure$/, title: 'Configure Strategy' },
-  { pattern: /^\/strategy\/[^/]+$/, title: 'View Strategy' },
   { pattern: /^\/python\/[^/]+\/edit$/, title: 'Edit Strategy' },
   { pattern: /^\/python\/[^/]+\/logs$/, title: 'Strategy Logs' },
   { pattern: /^\/python\/[^/]+\/schedule$/, title: 'Schedule Strategy' },
+  { pattern: /^\/strategy\/[^/]+\/edit$/, title: 'Edit Strategy' },
+  { pattern: /^\/strategy\/[^/]+$/, title: 'Strategy' },
   { pattern: /^\/chartink\/[^/]+\/configure$/, title: 'Configure Chartink' },
   { pattern: /^\/chartink\/[^/]+$/, title: 'View Chartink Strategy' },
   { pattern: /^\/flow\/editor\/[^/]+$/, title: 'Flow Editor' },

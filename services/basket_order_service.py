@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, BasketCompletedEvent, OrderFailedEvent
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -138,8 +139,16 @@ def place_single_order(
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
         if res.status == 200:
-            # No per-order event emission - a summary event is emitted at the end of all orders
-            return {"symbol": order_data["symbol"], "status": "success", "orderid": order_id}
+            # No per-order event emission - a summary event is emitted at the end of all orders.
+            # exchange/product identify the leg: a basket spans several contracts, so the
+            # summary event cannot supply them and subscribers have only this dict to key on.
+            return {
+                "symbol": order_data["symbol"],
+                "exchange": order_data.get("exchange", ""),
+                "product": order_data.get("product", ""),
+                "status": "success",
+                "orderid": order_id,
+            }
         else:
             message = (
                 response_data.get("message", "Failed to place order")
@@ -148,6 +157,16 @@ def place_single_order(
             )
             return {"symbol": order_data["symbol"], "status": "error", "message": message}
 
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Basket leg {order_data.get('symbol', 'Unknown')} not sent: {e}")
+        return {
+            "symbol": order_data.get("symbol", "Unknown"),
+            "status": "error",
+            "message": str(e),
+        }
     except Exception as e:
         logger.exception(f"Error placing order for {order_data.get('symbol', 'Unknown')}: {e}")
         return {
@@ -261,6 +280,8 @@ def process_basket_order_with_auth(
                 analyze_results.append(
                     {
                         "symbol": order.get("symbol", "Unknown"),
+                        "exchange": order.get("exchange", ""),
+                        "product": order.get("product", ""),
                         "status": "success",
                         "orderid": response.get("orderid"),
                         "batch_order": True,

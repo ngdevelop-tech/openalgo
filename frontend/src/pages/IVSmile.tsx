@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/select'
 import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import Plot from '@/lib/Plot2D'
+import { serverSentence } from '@/lib/serverSentence'
 import { useThemeStore } from '@/stores/themeStore'
 import { showToast } from '@/utils/toast'
 
@@ -41,17 +42,17 @@ function convertExpiryForAPI(expiry: string): string {
 
 export default function IVSmile() {
   const { mode, appMode } = useThemeStore()
-  const { fnoExchanges, defaultFnoExchange, defaultUnderlyings } = useSupportedExchanges()
+  const { toolsFnoExchanges, defaultToolsFnoExchange, defaultUnderlyings } = useSupportedExchanges()
   const isAnalyzer = appMode === 'analyzer'
   const isDark = mode === 'dark' || isAnalyzer
 
-  const [selectedExchange, setSelectedExchange] = useState(defaultFnoExchange)
+  const [selectedExchange, setSelectedExchange] = useState(defaultToolsFnoExchange)
   const [underlyings, setUnderlyings] = useState<string[]>(
-    defaultUnderlyings[defaultFnoExchange] || []
+    defaultUnderlyings[defaultToolsFnoExchange] || []
   )
   const [underlyingOpen, setUnderlyingOpen] = useState(false)
   const [selectedUnderlying, setSelectedUnderlying] = useState(
-    defaultUnderlyings[defaultFnoExchange]?.[0] || ''
+    defaultUnderlyings[defaultToolsFnoExchange]?.[0] || ''
   )
   const [expiries, setExpiries] = useState<string[]>([])
   const [selectedExpiry, setSelectedExpiry] = useState('')
@@ -64,9 +65,9 @@ export default function IVSmile() {
   // Re-sync exchange when broker capabilities load asynchronously
   useEffect(() => {
     setSelectedExchange((prev) =>
-      prev && fnoExchanges.some((ex) => ex.value === prev) ? prev : defaultFnoExchange
+      prev && toolsFnoExchanges.some((ex) => ex.value === prev) ? prev : defaultToolsFnoExchange
     )
-  }, [defaultFnoExchange, fnoExchanges])
+  }, [defaultToolsFnoExchange, toolsFnoExchanges])
 
   // Fetch underlyings when exchange changes
   useEffect(() => {
@@ -147,9 +148,9 @@ export default function IVSmile() {
       } else {
         showToast.error(response.message || 'Failed to fetch IV Smile data')
       }
-    } catch {
+    } catch (error) {
       if (requestIdRef.current !== requestId) return
-      showToast.error('Failed to fetch IV Smile data')
+      showToast.error(serverSentence(error, 'Failed to fetch IV Smile data'))
     } finally {
       if (requestIdRef.current === requestId) setIsLoading(false)
     }
@@ -369,7 +370,7 @@ export default function IVSmile() {
               <SelectValue placeholder="Exchange" />
             </SelectTrigger>
             <SelectContent>
-              {fnoExchanges.map((ex) => (
+              {toolsFnoExchanges.map((ex) => (
                 <SelectItem key={ex.value} value={ex.value}>
                   {ex.label}
                 </SelectItem>

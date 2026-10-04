@@ -25,6 +25,7 @@ _websocket_engine = None
 _thread_lock = threading.Lock()
 _stop_event = threading.Event()
 _current_engine_type = None  # Track which engine type is running
+_gtt_maintenance_thread = None
 _auto_upgrade_thread = None
 _auto_upgrade_stop_event = threading.Event()
 _auto_upgrade_enabled = False
@@ -62,6 +63,86 @@ class ExecutionEngineThread(threading.Thread):
     def stop(self):
         """Signal the thread to stop"""
         self.stop_event.set()
+
+
+class GTTMaintenanceThread(threading.Thread):
+    """Periodic GTT upkeep that neither execution engine performs.
+
+    Runs in both engine modes, which is the point: the polling engine reclaims
+    stranded legs on every tick, but in WebSocket mode - the default - that loop
+    never starts, so without this a leg stranded by a killed worker would sit
+    unclaimable until the next restart, and an expired GTT would hold its margin
+    indefinitely.
+
+    One module-level daemon thread doing two cheap indexed queries, rather than
+    a scheduler: the sweeps are seconds apart from each other at most and need
+    no cron semantics.
+    """
+
+    #: How often stranded claims are reverted. Well under the 60s default claim
+    #: timeout so a stranded leg is recovered within roughly one timeout.
+    RECLAIM_INTERVAL_SEC = 60
+
+    #: Expiry is a wall-clock event with a day's granularity; hourly is ample.
+    EXPIRY_INTERVAL_SEC = 3600
+
+    def __init__(self):
+        super().__init__(daemon=True, name="SandboxGTTMaintenance")
+        self.stop_event = threading.Event()
+
+    def run(self):
+        logger.debug("Sandbox GTT maintenance thread started")
+        seconds_since_expiry_sweep = 0
+
+        while not self.stop_event.is_set():
+            # Sleep first: at startup the catch-up processor has just run both
+            # of these, so doing them again immediately is pure duplication.
+            if self.stop_event.wait(self.RECLAIM_INTERVAL_SEC):
+                break
+
+            try:
+                from sandbox import gtt_manager
+
+                gtt_manager.reclaim_stranded_legs()
+
+                seconds_since_expiry_sweep += self.RECLAIM_INTERVAL_SEC
+                if seconds_since_expiry_sweep >= self.EXPIRY_INTERVAL_SEC:
+                    seconds_since_expiry_sweep = 0
+                    expired = gtt_manager.expire_due_gtts()
+                    if expired:
+                        logger.info(f"Expired {expired} GTT(s) past their expiry")
+            except Exception as e:
+                logger.exception(f"Error in GTT maintenance thread: {e}")
+
+        logger.debug("Sandbox GTT maintenance thread stopped")
+
+    def stop(self):
+        self.stop_event.set()
+
+
+def _start_gtt_maintenance():
+    """Start the GTT maintenance thread if it is not already running."""
+    global _gtt_maintenance_thread
+
+    if _gtt_maintenance_thread is not None and _gtt_maintenance_thread.is_alive():
+        return
+    _gtt_maintenance_thread = GTTMaintenanceThread()
+    _gtt_maintenance_thread.start()
+
+
+def _stop_gtt_maintenance():
+    """Stop the GTT maintenance thread if running."""
+    global _gtt_maintenance_thread
+
+    if _gtt_maintenance_thread is None:
+        return
+    try:
+        _gtt_maintenance_thread.stop()
+        _gtt_maintenance_thread.join(timeout=5)
+    except Exception as e:
+        logger.exception(f"Error stopping GTT maintenance thread: {e}")
+    finally:
+        _gtt_maintenance_thread = None
 
 
 def _is_websocket_proxy_healthy() -> bool:
@@ -147,6 +228,7 @@ def start_execution_engine(engine_type: str = None):
                         _websocket_engine = get_websocket_execution_engine()
                         _current_engine_type = "websocket"
                         logger.debug("WebSocket execution engine started (with built-in fallback)")
+                        _start_gtt_maintenance()
                         return True, "WebSocket execution engine started"
                     else:
                         logger.warning(
@@ -168,6 +250,7 @@ def start_execution_engine(engine_type: str = None):
             logger.debug("Polling execution engine started successfully")
             if _auto_upgrade_enabled:
                 _start_websocket_upgrade_watcher()
+            _start_gtt_maintenance()
             return True, "Polling execution engine started"
 
         except Exception as e:
@@ -183,11 +266,21 @@ def stop_execution_engine():
     global _execution_thread, _websocket_engine, _current_engine_type
     global _auto_upgrade_thread, _auto_upgrade_enabled
 
+    # Stop the auto-upgrade watcher BEFORE taking _thread_lock. The watcher
+    # takes that lock itself once its health check passes, so joining it
+    # while holding the lock could only time out: the stop waited its full
+    # five seconds, then declared stopped a watcher that went on to act on
+    # the engine afterwards.
+    _stop_websocket_upgrade_watcher()
+
     with _thread_lock:
         stopped_any = False
 
-        # Stop auto-upgrade watcher
-        _stop_websocket_upgrade_watcher()
+        # A watcher started while this call waited for the lock is told to
+        # stop too; it re-checks the flag as soon as it holds the lock.
+        _auto_upgrade_stop_event.set()
+
+        _stop_gtt_maintenance()
 
         # Stop WebSocket engine if running
         if _websocket_engine is not None:
@@ -248,6 +341,10 @@ def _start_websocket_upgrade_watcher():
             if not _is_websocket_proxy_healthy():
                 continue
             with _thread_lock:
+                # Re-check after acquiring: a stop may have been signalled
+                # while this watcher waited for the lock.
+                if _auto_upgrade_stop_event.is_set():
+                    break
                 # Only upgrade if polling is running and websocket engine is not
                 if _execution_thread is None or not _execution_thread.is_alive():
                     continue
@@ -275,9 +372,7 @@ def _start_websocket_upgrade_watcher():
                         _execution_thread = None
                         break
                     else:
-                        logger.warning(
-                            f"Auto-upgrade failed to start WebSocket engine: {message}"
-                        )
+                        logger.warning(f"Auto-upgrade failed to start WebSocket engine: {message}")
                 except Exception as e:
                     logger.exception(f"Error during auto-upgrade to WebSocket engine: {e}")
 
@@ -294,6 +389,15 @@ def _stop_websocket_upgrade_watcher():
     _auto_upgrade_stop_event.set()
     if _auto_upgrade_thread and _auto_upgrade_thread.is_alive():
         _auto_upgrade_thread.join(timeout=5)
+        if _auto_upgrade_thread.is_alive():
+            # Keep the reference: a live thread recorded as stopped is how an
+            # orphan goes on changing engine state unnoticed, and the next
+            # start would clear the stop flag it is still looping on.
+            logger.error(
+                "The sandbox engine's upgrade watcher did not stop within 5 seconds; "
+                "it is left recorded as running"
+            )
+            return
     _auto_upgrade_thread = None
 
 

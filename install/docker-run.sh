@@ -44,7 +44,7 @@ OPENALGO_DIR="$SCRIPT_DIR"
 XTS_BROKERS="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,rmoney,wisdom"
 
 # Valid brokers list
-VALID_BROKERS="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+VALID_BROKERS="fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha"
 
 # Banner
 echo ""
@@ -208,11 +208,11 @@ do_setup() {
     echo -e "${BLUE}  ========================================${NC}"
     echo ""
     echo "  Valid brokers:"
-    echo "  fivepaisa, fivepaisaxts, aliceblue, angel, compositedge,"
+    echo "  fivepaisa, fivepaisaxts, aliceblue, angel, arrow, compositedge,"
     echo "  definedge, deltaexchange, dhan, dhan_sandbox, firstock, flattrade, fyers,"
-    echo "  groww, ibulls, iifl, iiflcapital, indmoney, jainamxts, kotak, motilal,"
+    echo "  groww, hdfcsecurities, hdfcsky, ibulls, iifl, iiflcapital, indmoney, jainamxts, kotak, motilal,"
     echo "  mstock, nubra, paytm, pocketful, rmoney, samco, shoonya,"
-    echo "  tradejini, upstox, wisdom, zebu, zerodha"
+    echo "  tradejini, tradesmart, upstox, wisdom, zebu, zerodha"
     echo ""
 
     # Get broker name with validation
@@ -385,7 +385,7 @@ do_start() {
     fi
 
     # Stop and remove existing container if exists
-    docker stop "$CONTAINER" >/dev/null 2>&1
+    docker stop -t 45 "$CONTAINER" >/dev/null 2>&1
     docker rm "$CONTAINER" >/dev/null 2>&1
 
     # Calculate dynamic resource limits based on available RAM
@@ -430,6 +430,7 @@ do_start() {
     log_info "Starting container..."
     if docker run -d \
         --name "$CONTAINER" \
+        --stop-timeout 45 \
         --shm-size=${SHM_SIZE_MB}m \
         -p 5000:5000 \
         -p 8765:8765 \
@@ -480,7 +481,7 @@ do_start() {
 # Stop function
 do_stop() {
     log_info "Stopping OpenAlgo..."
-    docker stop "$CONTAINER" >/dev/null 2>&1
+    docker stop -t 45 "$CONTAINER" >/dev/null 2>&1
     docker rm "$CONTAINER" >/dev/null 2>&1
     log_ok "OpenAlgo stopped."
 }
@@ -545,6 +546,7 @@ do_migrate() {
         log_ok "Migrations completed successfully."
     else
         log_warn "Some migrations may have had issues. Check the output above."
+        return 1
     fi
 }
 

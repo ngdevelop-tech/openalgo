@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/select'
 import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import Plot from '@/lib/Plot3D'
+import { serverSentence } from '@/lib/serverSentence'
 import { useThemeStore } from '@/stores/themeStore'
 import { showToast } from '@/utils/toast'
 
@@ -50,17 +51,17 @@ function convertExpiryForAPI(expiry: string): string {
 
 export default function VolSurface() {
   const { mode, appMode } = useThemeStore()
-  const { fnoExchanges, defaultFnoExchange, defaultUnderlyings } = useSupportedExchanges()
+  const { toolsFnoExchanges, defaultToolsFnoExchange, defaultUnderlyings } = useSupportedExchanges()
   const isAnalyzer = appMode === 'analyzer'
   const isDark = mode === 'dark' || isAnalyzer
 
-  const [selectedExchange, setSelectedExchange] = useState(defaultFnoExchange)
+  const [selectedExchange, setSelectedExchange] = useState(defaultToolsFnoExchange)
   const [underlyings, setUnderlyings] = useState<string[]>(
-    defaultUnderlyings[defaultFnoExchange] || []
+    defaultUnderlyings[defaultToolsFnoExchange] || []
   )
   const [underlyingOpen, setUnderlyingOpen] = useState(false)
   const [selectedUnderlying, setSelectedUnderlying] = useState(
-    defaultUnderlyings[defaultFnoExchange]?.[0] || ''
+    defaultUnderlyings[defaultToolsFnoExchange]?.[0] || ''
   )
   const [expiries, setExpiries] = useState<string[]>([])
   const [selectedExpiries, setSelectedExpiries] = useState<string[]>([])
@@ -72,9 +73,9 @@ export default function VolSurface() {
   // Re-sync exchange when broker capabilities load asynchronously
   useEffect(() => {
     setSelectedExchange((prev) =>
-      prev && fnoExchanges.some((ex) => ex.value === prev) ? prev : defaultFnoExchange
+      prev && toolsFnoExchanges.some((ex) => ex.value === prev) ? prev : defaultToolsFnoExchange
     )
-  }, [defaultFnoExchange, fnoExchanges])
+  }, [defaultToolsFnoExchange, toolsFnoExchanges])
 
   // Send NFO/BFO directly — backend resolves correct exchange for index vs stock
 
@@ -142,9 +143,9 @@ export default function VolSurface() {
           // Auto-select first 4 expiries
           setSelectedExpiries(response.expiries.slice(0, 4))
         }
-      } catch {
+      } catch (error) {
         if (cancelled) return
-        showToast.error('Failed to fetch expiry dates')
+        showToast.error(serverSentence(error, 'Failed to fetch expiry dates'))
       }
     }
     fetchExpiries()
@@ -182,9 +183,9 @@ export default function VolSurface() {
       } else {
         showToast.error(res.message || 'Failed to load vol surface')
       }
-    } catch {
+    } catch (error) {
       if (requestIdRef.current !== requestId) return
-      showToast.error('Failed to fetch vol surface data')
+      showToast.error(serverSentence(error, 'Failed to fetch vol surface data'))
     } finally {
       if (requestIdRef.current === requestId) setIsLoading(false)
     }
@@ -295,7 +296,7 @@ export default function VolSurface() {
               <SelectValue placeholder="Exchange" />
             </SelectTrigger>
             <SelectContent>
-              {fnoExchanges.map((ex) => (
+              {toolsFnoExchanges.map((ex) => (
                 <SelectItem key={ex.value} value={ex.value}>
                   {ex.label}
                 </SelectItem>

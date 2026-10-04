@@ -4,9 +4,22 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 
 from dotenv import load_dotenv
+
+#: Serialises every writer of .env in this process: the startup rotations
+#: below, the admin MCP settings save and the broker credentials save. Each
+#: of them reads the file, changes some lines and writes it back, so two at
+#: once would each write back a copy without the other's change. One lock for
+#: all of them, because separate locks per caller would not serialise them
+#: against each other. Reentrant, so a caller holding it for its own
+#: read-modify-write can still call update_env_values(). A stdlib lock: only
+#: request threads and startup write .env, never a real thread under eventlet.
+ENV_WRITE_LOCK = threading.RLock()
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Placeholder values shipped in .sample.env. OpenAlgo detects these on startup
 # and rotates them to fresh random secrets on first run. Coordinated with the
@@ -86,7 +99,7 @@ def check_tmp_noexec() -> None:
                     mount_options = parts[3].split(',')
                     if 'noexec' in mount_options:
                         print("\n" + "=" * 70)
-                        print("⚠️  WARNING: /tmp is mounted with 'noexec' flag")
+                        print("WARNING: /tmp is mounted with 'noexec' flag")
                         print("   This can cause issues with Python libraries like numba/llvmlite.")
                         print("")
                         print("   OpenAlgo has auto-configured alternative paths:")
@@ -152,7 +165,7 @@ def check_env_version_compatibility() -> bool:
     # If either version is missing, warn but continue
     if not env_version:
         print("\n" + "=" * 70)
-        print("⚠️  WARNING: No version found in your .env file")
+        print("WARNING: No version found in your .env file")
         print("   Your .env file may be outdated and missing new configuration options.")
         print("   Consider updating it with new variables from .sample.env")
         print("=" * 70)
@@ -180,24 +193,35 @@ def check_env_version_compatibility() -> bool:
         sample_ver = version_tuple(sample_version)
 
         if env_ver < sample_ver:
-            print("\n" + "🔴 " + "=" * 68)
-            print("🔴  CONFIGURATION UPDATE REQUIRED")
-            print("🔴 " + "=" * 68)
+            print("\n" + "=" * 70)
+            print("  CONFIGURATION UPDATE REQUIRED")
+            print("=" * 70)
             print(f"   Your .env version: {env_version}")
             print(f"   Required version:  {sample_version}")
             print("")
             print("   ACTION NEEDED:")
-            print("   1. Backup your current .env file")
+            print("   1. Backup your current .env file  (cp .env .env.backup)")
             print("   2. Compare .env with .sample.env")
             print("   3. Add any missing configuration variables to your .env")
             print("   4. Update ENV_CONFIG_VERSION in your .env to match .sample.env")
             print("")
+            print("   ADD the missing variables to your existing .env. Do NOT copy")
+            print("   .sample.env over it. These three values are unrecoverable and")
+            print("   must keep the values your install is already using:")
+            print("")
+            print("     API_KEY_PEPPER  - hashes your password and encrypts your")
+            print("                       broker tokens. Change it and you can never")
+            print("                       log in again; the hash is one-way.")
+            print("     FERNET_SALT     - encrypts the same data alongside the pepper.")
+            print("     APP_KEY         - signs session cookies (safe to change, but")
+            print("                       every logged-in browser is signed out).")
+            print("")
             print("   New features may not work properly with an outdated configuration!")
-            print("🔴 " + "=" * 68)
+            print("=" * 70)
 
             # Give user a chance to continue anyway
             try:
-                response = input("\n⚠️  Continue anyway? (y/N): ").lower().strip()
+                response = input("\nContinue anyway? (y/N): ").lower().strip()
                 if response not in ["y", "yes"]:
                     print("\nApplication startup cancelled. Please update your .env file.")
                     return False
@@ -206,7 +230,7 @@ def check_env_version_compatibility() -> bool:
                 return False
 
         elif env_ver > sample_ver:
-            print(f"\n✅ Your .env version ({env_version}) is newer than sample ({sample_version})")
+            print(f"\nYour .env version ({env_version}) is newer than sample ({sample_version})")
 
         else:
             # Only print success message in Flask child process (avoids duplicate message with debug reloader)
@@ -216,7 +240,7 @@ def check_env_version_compatibility() -> bool:
             is_reloader_parent = flask_debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
             if not is_reloader_parent:
                 print(
-                    f"\n\033[94m🔄\033[0m Configuration version check passed (\033[92m{env_version}\033[0m)"
+                    f"\nConfiguration version check passed (\033[92m{env_version}\033[0m)"
                 )
 
     except Exception as e:
@@ -303,11 +327,12 @@ def _atomic_rewrite_dotenv(env_path: str, pairs: list) -> None:
             file lock on Windows, permission denied, etc.). Caller surfaces
             this with a manual-rotation instruction.
     """
-    with open(env_path, "r", encoding="utf-8", newline="") as f:
-        content = f.read()
-    for old, new in pairs:
-        content = content.replace(old, new)
-    _atomic_replace_text(env_path, content)
+    with ENV_WRITE_LOCK:
+        with open(env_path, "r", encoding="utf-8", newline="") as f:
+            content = f.read()
+        for old, new in pairs:
+            content = content.replace(old, new)
+        _atomic_replace_text(env_path, content)
 
 
 # Errors that mean "the temp-file-then-rename pattern can't work in this
@@ -469,6 +494,72 @@ def _atomic_replace_text(path: str, content: str) -> None:
             os.fsync(f.fileno())
         except OSError:
             pass
+
+
+def atomic_replace_text(path: str, content: str) -> None:
+    """Replace the whole of ``path`` with ``content`` as safely as the file allows.
+
+    The public name for :func:`_atomic_replace_text`. It does not take
+    ``ENV_WRITE_LOCK`` itself: a caller doing a read-modify-write of .env holds
+    the lock across the read and this call, or uses :func:`update_env_values`.
+    """
+    _atomic_replace_text(path, content)
+
+
+def _env_line(key: str, value: str) -> str:
+    """Format ``KEY = 'value'``, the style install.sh writes."""
+    if "'" in value:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'{key} = "{escaped}"'
+    return f"{key} = '{value}'"
+
+
+def update_env_values(path: str, updates: dict) -> None:
+    """Set each key in ``updates`` in the .env file at ``path``, atomically.
+
+    Every line assigning a key is replaced, duplicates included: python-dotenv
+    applies the last assignment, so replacing only the first would leave the
+    value the app reads unchanged. This matches the broker credentials writer.
+    A commented-out line is left alone, and a key not present is appended.
+    Line endings and every other line are preserved. The read and the write
+    happen under ``ENV_WRITE_LOCK``, so two saves at once cannot each write
+    back a copy without the other's change.
+
+    Args:
+        path: The .env file.
+        updates: Key to new value. Values are written single-quoted, or
+            double-quoted with escaping when they contain a single quote.
+
+    Raises:
+        ValueError: A key is not a valid variable name, or a value contains a
+            line break.
+        OSError: The file could not be read or written.
+    """
+    for key, value in updates.items():
+        if not _ENV_KEY_RE.match(str(key)):
+            raise ValueError(f"Refusing to write malformed env key: {key!r}")
+        if "\n" in str(value) or "\r" in str(value):
+            raise ValueError(f"Refusing to write a line break into env key {key}")
+
+    with ENV_WRITE_LOCK:
+        with open(path, encoding="utf-8", newline="") as f:
+            content = f.read()
+        lines = content.splitlines(keepends=True)
+        eol = "\r\n" if "\r\n" in content else "\n"
+        for key, value in updates.items():
+            pattern = re.compile(rf"^[ \t]*(?:export[ \t]+)?{re.escape(str(key))}[ \t]*=")
+            new_line = _env_line(str(key), str(value))
+            replaced = False
+            for index, line in enumerate(lines):
+                if pattern.match(line):
+                    ending = line[len(line.rstrip("\r\n")) :]
+                    lines[index] = new_line + ending
+                    replaced = True
+            if not replaced:
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    lines[-1] = lines[-1] + eol
+                lines.append(new_line + eol)
+        _atomic_replace_text(path, "".join(lines))
 
 
 # .sample.env ships this placeholder so install scripts and the bootstrap
@@ -645,7 +736,8 @@ def _ensure_fernet_salt(env_path: str) -> None:
             content, pepper_pat, fernet_line_pat, existing_value, eol
         )
         try:
-            _atomic_replace_text(env_path, new_content)
+            with ENV_WRITE_LOCK:
+                _atomic_replace_text(env_path, new_content)
         except OSError as e:
             _warn_fernet_write_failed("Could not relocate FERNET_SALT line in .env", e)
             os.environ["FERNET_SALT"] = existing_value
@@ -710,7 +802,8 @@ def _ensure_fernet_salt(env_path: str) -> None:
         content, pepper_pat, fernet_line_pat, new_salt, eol
     )
     try:
-        _atomic_replace_text(env_path, new_content)
+        with ENV_WRITE_LOCK:
+            _atomic_replace_text(env_path, new_content)
     except OSError as e:
         _warn_fernet_write_failed("Could not write FERNET_SALT to .env", e)
         return  # legacy static salt remains in effect via auth_db fallback
@@ -1066,6 +1159,54 @@ def _generate_keys_on_first_run(env_path: str) -> None:
     # in-place would brick existing Argon2 password hashes and Fernet-encrypted
     # tokens. The dedicated upgrade/rotate_pepper.py migration handles that
     # case explicitly with re-encryption + password reset.
+    #
+    # But silence is the wrong default for that state, so warn — every startup,
+    # not once. Two things are true at the same time here and the operator can
+    # see neither of them:
+    #
+    #   1. The pepper is the value published in .sample.env, so every stored
+    #      broker token / API key / TOTP secret in this DB is decryptable by
+    #      anyone who obtains the file.
+    #   2. If the account was created while a *different* pepper was in effect
+    #      (the usual cause: .sample.env was copied over a working .env), every
+    #      login now fails with a bare "Invalid credentials" and nothing else
+    #      in the app explains why. See issue #1660.
+    if pepper_compromised and db_populated and not is_reloader_parent:
+        sys.stderr.write(
+            "\n\033[91m\033[1m[OpenAlgo security] API_KEY_PEPPER is the public sample value\033[0m\n"
+            "\033[91mYour .env still carries the API_KEY_PEPPER placeholder from\n"
+            ".sample.env, and this database already has a user account.\n"
+            "\n"
+            "It was NOT rotated automatically - rotating it would permanently\n"
+            "destroy your stored password hash and broker tokens.\n"
+            "\n"
+            "Two consequences, both active right now:\n"
+            "\n"
+            "  1. Every broker token, API key and TOTP secret in this database\n"
+            "     is encrypted with a publicly-known value. Treat them as\n"
+            "     exposed and re-issue them once the pepper is fixed.\n"
+            "\n"
+            "  2. If you cannot log in ('Invalid credentials' with a password\n"
+            "     you know is correct), this is why: your account was created\n"
+            "     while a different pepper was in effect, so the stored hash no\n"
+            "     longer matches. This usually happens when .sample.env is\n"
+            "     copied over a working .env during an upgrade.\n"
+            "\n"
+            "To fix:\n"
+            "  - If you have a backup of the .env you set up with, restore its\n"
+            "    API_KEY_PEPPER and FERNET_SALT lines and restart. This is the\n"
+            "    only route that keeps your existing password and tokens.\n"
+            "  - Otherwise, rotate deliberately and reset the password:\n"
+            "      uv run python upgrade/rotate_pepper.py\n"
+            "      uv run python upgrade/reset_admin_password.py\n"
+            "  - On a throwaway install with nothing to keep, deleting\n"
+            "    db/openalgo.db and restarting lets first-run setup generate a\n"
+            "    fresh pepper for you.\n"
+            "\n"
+            "Run 'uv run python upgrade/init_db.py' to see which of these\n"
+            "applies to your install.\n"
+            "\033[0m\n"
+        )
 
 
 def load_and_check_env_variables() -> None:

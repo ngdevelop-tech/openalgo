@@ -4,11 +4,12 @@ Complete Docker deployment and troubleshooting documentation for OpenAlgo.
 
 ---
 
-## 📚 Table of Contents
+## Table of Contents
 
 ### Getting Started
 
 - **[docker.md](docker.md)** - Basic Docker deployment guide
+- **[Optional gthread worker](../gthread/README.md#installing-with-gthread)** - Select gthread, configure the 45-second shutdown grace, verify it, and switch back to eventlet
 - **[DOCKER_BUILD_GUIDE.md](DOCKER_BUILD_GUIDE.md)** - Complete build and deployment guide (12 KB)
   - Build process details
   - Configuration requirements
@@ -52,7 +53,7 @@ Complete Docker deployment and troubleshooting documentation for OpenAlgo.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Desktop Installation (macOS/Linux)
 ```bash
@@ -76,7 +77,7 @@ sudo ./install-docker.sh
 
 ---
 
-## 🔧 Common Issues
+## Common Issues
 
 ### numba/scipy Errors
 If you see errors like:
@@ -94,7 +95,7 @@ For environment variable issues, see [docker_env_changes.md](docker_env_changes.
 
 ---
 
-## 📖 Document Index
+## Document Index
 
 | Document | Size | Purpose | Audience |
 |----------|------|---------|----------|
@@ -110,7 +111,7 @@ For environment variable issues, see [docker_env_changes.md](docker_env_changes.
 
 ---
 
-## 🐳 Docker Configuration
+## Docker Configuration
 
 ### Current Setup
 
@@ -152,7 +153,7 @@ The Docker image includes:
 
 ---
 
-## 🧪 Testing
+## Testing
 
 ### Verify Installation
 ```bash
@@ -160,7 +161,7 @@ The Docker image includes:
 docker ps --filter "name=openalgo"
 
 # Test numba/scipy
-docker exec openalgo python -c "import numba, scipy; print('✓ OK')"
+docker exec openalgo python -c "import numba, scipy; print('OK')"
 
 # View logs
 docker-compose logs -f
@@ -180,20 +181,20 @@ docker inspect openalgo --format='{{range .Mounts}}{{.Destination}} {{end}}'
 
 ---
 
-## 📝 Recent Updates
+## Recent Updates
 
 ### 2026-01-28 - numba/scipy Support
-- ✅ Added runtime dependencies (libopenblas0, libgomp1, libgfortran5)
-- ✅ Configured TMPDIR and NUMBA_CACHE_DIR environment variables
-- ✅ Added 2GB shared memory allocation
-- ✅ Fixed /app/tmp permissions using named volume
-- ✅ Updated all installation scripts
+- Added runtime dependencies (libopenblas0, libgomp1, libgfortran5)
+- Configured TMPDIR and NUMBA_CACHE_DIR environment variables
+- Added 2GB shared memory allocation
+- Fixed /app/tmp permissions using named volume
+- Updated all installation scripts
 
 **Result:** All numba/scipy/llvmlite errors resolved!
 
 ---
 
-## 🆘 Support
+## Support
 
 If you encounter issues:
 
@@ -218,7 +219,7 @@ If you encounter issues:
 
 ---
 
-## 🔗 Related Documentation
+## Related Documentation
 
 - [Installation Scripts](/install/) - Desktop and server installation scripts
 - [Main Documentation](https://docs.openalgo.in) - Official documentation site

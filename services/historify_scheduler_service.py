@@ -4,7 +4,6 @@ Historify Scheduler Service
 Handles scheduled historical data downloads using APScheduler (Flask/sync version)
 """
 
-import os
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,9 +13,33 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from database.apscheduler_jobstore_db import (
+    HISTORIFY_JOBSTORE_TABLE,
+    ensure_jobstore_table,
+    get_database_url,
+)
+from database.engine_factory import create_db_engine
+from utils import real_threading
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_active_schedule_runs: set[str] = set()
+_active_schedule_runs_lock = real_threading.Lock()
+
+
+def claim_schedule_run(schedule_id: str) -> bool:
+    """Claim a schedule until its submitted download job reaches a terminal state."""
+    with _active_schedule_runs_lock:
+        if schedule_id in _active_schedule_runs:
+            return False
+        _active_schedule_runs.add(schedule_id)
+        return True
+
+
+def release_schedule_run(schedule_id: str) -> None:
+    with _active_schedule_runs_lock:
+        _active_schedule_runs.discard(schedule_id)
 
 
 class HistorifyScheduler:
@@ -46,15 +69,29 @@ class HistorifyScheduler:
                 return
 
             if db_url is None:
-                db_url = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
+                db_url = get_database_url()
 
             self._api_key = api_key
             self._socketio = socketio
 
             try:
+                # Create the job store table before APScheduler would. Its own
+                # DDL in start() is one-shot: an install that loses the boot
+                # write-lock race never initializes the scheduler, and every
+                # scheduled download then silently never runs for the life of
+                # the process (issue #1750). app.py normally creates this during
+                # the serialized database-init phase, which leaves the call
+                # below a read-only no-op; it retries here for any caller that
+                # starts the scheduler outside that path.
+                ensure_jobstore_table(HISTORIFY_JOBSTORE_TABLE, database_url=db_url)
+
+                # engine= rather than url= so the job store uses the project
+                # NullPool policy instead of SQLAlchemy's default QueuePool,
+                # which would hold connections open for the life of the
+                # process. See database/engine_factory.py.
                 jobstores = {
                     "default": SQLAlchemyJobStore(
-                        url=db_url, tablename="historify_apscheduler_jobs"
+                        engine=create_db_engine(db_url), tablename=HISTORIFY_JOBSTORE_TABLE
                     )
                 }
                 self._scheduler = BackgroundScheduler(
@@ -505,9 +542,14 @@ def execute_schedule(schedule_id: str, api_key: str = None):
     )
     from services.historify_service import create_and_start_job
 
+    if not claim_schedule_run(schedule_id):
+        logger.info(f"Scheduled download {schedule_id} is already running; skipping overlap")
+        return
+
     logger.info(f"Executing scheduled download: {schedule_id}")
 
     execution_id = None
+    job_started = False
 
     try:
         # Get schedule configuration
@@ -565,18 +607,17 @@ def execute_schedule(schedule_id: str, api_key: str = None):
             start_date=start_date,
             end_date=end_date,
             api_key=effective_api_key,
-            config={"schedule_id": schedule_id},
+            config={"schedule_id": schedule_id, "schedule_execution_id": execution_id},
             incremental=True,
         )
 
         if success:
             job_id = response.get("job_id")
+            job_started = True
             if execution_id:
                 update_schedule_execution(
                     execution_id, download_job_id=job_id, symbols_processed=len(symbols)
                 )
-            update_schedule(schedule_id, status="idle", last_run_status="success")
-            increment_schedule_run_counts(schedule_id, is_success=True)
             logger.info(f"Scheduled download started: {job_id} ({len(symbols)} symbols)")
 
             # Emit Socket.IO event
@@ -608,6 +649,28 @@ def execute_schedule(schedule_id: str, api_key: str = None):
             )
         update_schedule(schedule_id, status="idle", last_run_status="error")
         increment_schedule_run_counts(schedule_id, is_success=False)
+    finally:
+        # A successfully-created download owns this claim until its processor
+        # calls release_schedule_run. Every early/error path ends here.
+        if not job_started:
+            release_schedule_run(schedule_id)
+        # APScheduler runs this on its own worker thread with no Flask app
+        # context, so teardown_appcontext never fires and every scoped session
+        # this run touched - auth_db for the API key lookup, plus whatever
+        # create_and_start_job reaches - stays bound to that thread holding its
+        # SQLite connection. The worker threads are reused, so the connections
+        # accumulate rather than being released when a run ends, and production
+        # is a single Gunicorn worker that never restarts.
+        #
+        # This has to be a finally rather than a line at the end: the four
+        # early returns above (missing schedule, disabled, no API key, no
+        # symbols) are the common paths and would otherwise skip it entirely.
+        #
+        # Same cleanup flow_scheduler_service, flow_price_monitor_service and
+        # flow_order_update_monitor_service already do. See issue #1738.
+        from utils.db_sessions import remove_all_scoped_sessions
+
+        remove_all_scoped_sessions()
 
 
 # Global scheduler instance

@@ -1,8 +1,22 @@
 # Strategy Risk Management & Position Tracking — PRD
 
 **Date**: 2026-02-06
-**Status**: Draft
+**Status**: Superseded (originally Draft)
 **Scope**: Webhook + Chartink Strategies (V1)
+
+---
+
+> **Status note (2026-08-30):** the legacy `/strategy` webhook module this PRD was
+> written against has been removed from OpenAlgo. Every reference below to
+> `blueprints/strategy.py`, `database/strategy_db.py`, the `Strategy` and
+> `StrategySymbolMapping` tables, the `/strategy/api/*` endpoints in Section 15,
+> the `/strategy/dashboard` page in Section 12, and the webhook handler changes in
+> Section 16.1 describes code that no longer exists. The document is retained as
+> the requirements record for the replacement risk management module. The risk
+> semantics, options and futures mapping rules, exit execution model, and
+> concurrency safeguards still apply, but they must be re-targeted at the
+> surviving automation surfaces (Chartink and Flow). Do not implement the route,
+> schema, or file layout details as written.
 
 ---
 
@@ -1301,9 +1315,9 @@ Single unified page for managing all strategy positions.
 │  │──────────────────────────────────────────────────────│  │
 │  │ Symbol  Qty   Avg      LTP      P&L     SL   TGT TS │  │
 │  │ SBIN    +100  800.00   812.50   +1,250  784  840 792 │  │
-│  │                                          [Close ✕]   │  │
+│  │                                          [Close ]   │  │
 │  │ INFY    +50   1520.00  1498.00  -1,100  1490 1596 —  │  │
-│  │                                          [Close ✕]   │  │
+│  │                                          [Close ]   │  │
 │  │──────────────────────────────────────────────────────│  │
 │  │ [Close All Positions]  [Orders 8] [Trades 4] [P&L]  │  │
 │  └──────────────────────────────────────────────────────┘  │
@@ -1328,7 +1342,7 @@ Single unified page for managing all strategy positions.
 | **[Activate] / [Deactivate]** | Toggle risk monitoring on/off (confirmation dialog) |
 | Strategy summary | Total P&L (live), position count, trade count today, win rate, profit factor |
 | Position table | Symbol, Qty (+/-), Avg, LTP (live), P&L (live), SL, TGT, TS |
-| **[Close ✕]** per position | Close individual position at MARKET. Confirmation dialog. |
+| **[Close ]** per position | Close individual position at MARKET. Confirmation dialog. |
 | **[Close All Positions]** | Close all strategy positions at MARKET. Confirmation dialog. |
 | **[Orders N]** | Opens drawer with strategy orderbook (same format as global /orderbook) |
 | **[Trades N]** | Opens drawer with strategy tradebook (same format as global /tradebook) |
@@ -1377,7 +1391,7 @@ When configuring a symbol mapping, the UI adapts based on the selected `order_mo
 ┌────────────────────────────────────────────────────┐
 │  Order Mode: [Equity ▼] [Futures] [Single Option] [Multi-Leg]  │
 │                                                     │
-│  Underlying:  [🔍 Search underlying... ]           │
+│  Underlying:  [ Search underlying... ]           │
 │               ┌─────────────────────────┐          │
 │               │ NIFTY                    │          │
 │               │ BANKNIFTY                │          │

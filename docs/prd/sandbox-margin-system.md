@@ -55,6 +55,44 @@ def calculate_margin(symbol, exchange, action, quantity, product, price):
     return margin
 ```
 
+## Known limitation: short options are not SPAN margined
+
+**A short option in sandbox blocks the premium, not the real margin.** Every
+margin in this system is `traded value / leverage`, and for an option the traded
+value is `premium x quantity`. That is correct for buying an option, where the
+premium really is the whole cost. It is wrong for selling one, where a broker
+blocks SPAN plus exposure computed on the **underlying notional**, and the
+premium received is largely irrelevant to the number.
+
+Measured on a live instance, one lot of NIFTY (lot size 65):
+
+| Order | Sandbox blocks | A real broker blocks |
+| --- | --- | --- |
+| BUY 1 lot at premium 100 | 6,500 | about 6,500 (correct) |
+| SELL 1 lot at premium 100 | 6,500 | roughly 1.2 to 1.5 lakh |
+| SELL 1 lot at premium 2 | 130 | roughly 1.2 to 1.5 lakh |
+
+So a short-option strategy will pass margin checks in sandbox that would be
+rejected live, and the further out of the money the strike, the wider the gap:
+the sandbox number shrinks with the premium while the real requirement barely
+moves.
+
+**No configuration fixes this.** `option_sell_leverage` divides, so its lowest
+supported value of 1 already blocks the most it can, a full premium. Raising it
+blocks less. And because SPAN is roughly constant per lot while the premium is
+not, no single multiplier can track it: a value tuned for an at-the-money strike
+is wrong by an order of magnitude for a far out-of-the-money one.
+
+**What this means in practice.** Sandbox remains sound for order flow, fills,
+square-off, P&L attribution and strategy logic, including on short options. Do
+not use it to size positions or to validate that a short-option strategy fits a
+given capital. Check the real margin with `/api/v1/margincalculator` or your
+broker before going live.
+
+Modelling this properly needs a SPAN and exposure calculation per underlying,
+including offsets for hedged legs, which is why it is a documented limitation
+rather than an approximation. See issue #1795.
+
 ## Margin Operations
 
 ### 1. Block Margin (Order Placement)
@@ -134,7 +172,7 @@ def book_pnl(pnl_amount, description=""):
 │  2. Check Available Balance                                  │
 │     Available: ₹1,00,00,000                                  │
 │     Required: ₹62,000                                        │
-│     ✓ Sufficient                                             │
+│ Sufficient                                             │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -288,7 +326,7 @@ def validate_margin_for_order(order):
 ### Get Funds
 
 ```
-GET /api/v1/funds
+POST /api/v1/funds
 
 Response:
 {
@@ -303,15 +341,15 @@ Response:
 }
 ```
 
-### Reset Funds (Sandbox Only)
+### Reset Sandbox State And Funds
 
 ```
-POST /analyzer/reset-funds
+POST /sandbox/reset
 
 Response:
 {
     "status": "success",
-    "message": "Funds reset to ₹1,00,00,000"
+    "message": "Sandbox reset to defaults and all data cleared"
 }
 ```
 
@@ -319,10 +357,12 @@ Response:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `SANDBOX_INITIAL_CAPITAL` | `10000000` | Starting capital (₹1 Cr) |
-| `SANDBOX_MIS_LEVERAGE` | `5` | MIS leverage multiplier |
-| `SANDBOX_CNC_LEVERAGE` | `1` | CNC leverage (no leverage) |
-| `SANDBOX_NRML_LEVERAGE` | `1` | NRML leverage (no leverage) |
+| `starting_capital` | `10000000.00` | Persisted sandbox starting capital |
+| `equity_mis_leverage` | `5` | Equity MIS leverage multiplier |
+| `equity_cnc_leverage` | `1` | Equity CNC leverage multiplier |
+| `futures_leverage` | `10` | Futures leverage multiplier |
+| `option_buy_leverage` | `1` | Long-option leverage multiplier |
+| `option_sell_leverage` | `1` | Short-option leverage multiplier |
 
 ## Error Codes
 

@@ -77,7 +77,7 @@ sudo chown $USER:$USER /opt/openalgo
 
 # Clone repository
 cd /opt/openalgo
-git clone https://github.com/marketcalls/openalgo.git .
+git clone --filter=blob:none https://github.com/marketcalls/openalgo.git .
 ```
 
 ### 2. Setup Python Environment
@@ -120,7 +120,7 @@ cd ..
 
 ### 5. Create Systemd Service
 
-**Note:** The WebSocket server runs as a thread inside the main app (port 8765), so only ONE systemd service is needed.
+**Note:** One systemd service is sufficient. Under Gunicorn/eventlet, `websocket_proxy.app_integration` spawns the WebSocket proxy as an isolated child process on port 8765; it is not an in-process daemon thread.
 
 ```bash
 sudo nano /etc/systemd/system/openalgo.service
@@ -171,6 +171,15 @@ sudo nano /etc/nginx/sites-available/openalgo
 ```
 
 ```nginx
+# Send "Connection: upgrade" upstream only for a real WebSocket handshake.
+# Hardcoding "upgrade" makes every ordinary request reach gunicorn claiming an
+# upgrade with an empty Upgrade:, which breaks HTTP/1.1 keep-alive and causes
+# intermittent truncated responses and 5xx. See GitHub issue #1807.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
     server_name your-domain.com;
@@ -201,9 +210,10 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # WebSocket support for Socket.IO
+        # WebSocket support for Socket.IO. Socket.IO also long-polls over plain
+        # HTTP, so this must not force the upgrade header - see the map above.
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $connection_upgrade;
         proxy_read_timeout 86400;
     }
 
@@ -212,7 +222,7 @@ server {
         proxy_pass http://127.0.0.1:8765;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $connection_upgrade;
         proxy_set_header Host $host;
         proxy_read_timeout 86400;
     }
@@ -319,4 +329,4 @@ sudo systemctl start openalgo
 | `/opt/openalgo/.env` | Application config |
 | `/var/log/nginx/` | Nginx logs |
 
-**Note:** There is no separate `openalgo-ws.service`. The WebSocket server runs as a thread inside the main Flask application on port 8765.
+**Note:** There is no separate `openalgo-ws.service`. The Gunicorn-managed application starts the WebSocket proxy as a child process on port 8765, and systemd's service cgroup owns both processes.

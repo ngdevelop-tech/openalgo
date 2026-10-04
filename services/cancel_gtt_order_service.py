@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, GTTCancelFailedEvent, GTTCancelledEvent
+from utils.broker_backpressure import BrokerBusyError
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -48,12 +49,23 @@ def cancel_gtt_order_with_auth(
     api_key = original_data.get("apikey", "")
 
     if get_analyze_mode():
-        error_response = {
-            "mode": "analyze",
-            "status": "error",
-            "message": "Sandbox GTT support not yet implemented",
-        }
-        return False, error_response, 501
+        from services.sandbox_service import sandbox_cancel_gtt_order
+
+        success, response, status_code = sandbox_cancel_gtt_order(trigger_id, api_key)
+        if success:
+            bus.publish(GTTCancelledEvent(
+                mode="analyze", api_type=API_TYPE,
+                trigger_id=trigger_id,
+                request_data=order_request_data, response_data=response, api_key=api_key,
+            ))
+        else:
+            bus.publish(GTTCancelFailedEvent(
+                mode="analyze", api_type=API_TYPE,
+                trigger_id=trigger_id,
+                error_message=response.get("message", "GTT cancel failed"),
+                request_data=order_request_data, response_data=response, api_key=api_key,
+            ))
+        return success, response, status_code
 
     broker_module = import_broker_gtt_module(broker)
     if broker_module is None:
@@ -68,6 +80,24 @@ def cancel_gtt_order_with_auth(
 
     try:
         response_message, status_code = broker_module.cancel_gtt_order(trigger_id, auth_token)
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"GTT cancel not sent, broker busy: {e}")
+        error_response = {"status": "error", "message": str(e)}
+        bus.publish(
+            GTTCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                trigger_id=trigger_id,
+                error_message=str(e),
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+            )
+        )
+        return False, error_response, 429
     except Exception as e:
         logger.exception(f"Error in broker_module.cancel_gtt_order: {e}")
         error_response = {"status": "error", "message": "Failed to cancel GTT due to internal error"}
