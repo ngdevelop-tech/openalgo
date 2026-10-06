@@ -18,6 +18,8 @@ from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.position_read import read_position_book, refuse_smart_order_on_read_failure
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
 
 logger = get_logger(__name__)
 
@@ -97,46 +99,48 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
-_symbol_locks_lock = threading.Lock()
+# The registry forgets a symbol once nobody holds or waits on it, and under the
+# gthread worker a wait is bounded (utils/smart_order_guard.py).
+_SMART_ORDER_LOCKS = SymbolLocks()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
-_position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+# A fetch still in flight when an order invalidates the cache is returned to its
+# own caller but never cached, so the next order cannot read the book from
+# before the previous fill (utils/smart_order_guard.py).
+_POSITION_BOOK = PositionBookCache()
 
 
 def _get_symbol_lock(symbol, exchange, product):
-    """Get or create a per-symbol lock for serializing smart orders."""
-    key = f"{symbol}:{exchange}:{product}"
-    with _symbol_locks_lock:
-        if key not in _symbol_locks:
-            _symbol_locks[key] = threading.Lock()
-        return _symbol_locks[key]
+    """Hold the smart order lock for one symbol, as a context manager.
+
+    Yields True while holding it. Yields False when the wait ran out, which
+    happens only under the gthread worker; the caller must then return
+    ``SymbolLocks.busy(symbol)`` without placing an order.
+    """
+    return _SMART_ORDER_LOCKS.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """Paytm Money wraps a position book it read as {"status": "success", ...}."""
+    return isinstance(positions_data, dict) and positions_data.get("status") == "success"
 
 
 def _get_cached_positions(auth):
     """Get positions from cache if fresh, otherwise fetch from broker API."""
-    with _position_cache_lock:
-        now = time.monotonic()
-        cached = _position_cache.get(auth)
-        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
-            return cached["data"]
-
-    # Cache miss or expired - fetch from broker
-    positions_data = get_positions(auth)
-
-    with _position_cache_lock:
-        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
-
-    return positions_data
+    return _POSITION_BOOK.get(
+        auth,
+        lambda: read_position_book("paytm", lambda: get_positions(auth), _position_book_ok),
+    )
 
 
 def _invalidate_position_cache(auth):
-    """Invalidate the position cache so the next queued order fetches fresh data."""
-    with _position_cache_lock:
-        _position_cache.pop(auth, None)
+    """Invalidate the position cache so the next queued order fetches fresh data.
+
+    Also stops a fetch that started before this order from caching the book
+    it read.
+    """
+    _POSITION_BOOK.invalidate(auth)
 
 
 
@@ -223,11 +227,11 @@ def get_open_positionss(tradingsymbol, exchange, product, auth):
 
             if security_match and exchange_match and product_match:
                 net_qty = str(position.get("net_qty", position.get("netQty", "0")))
-                logger.info(f"✓ Found matching position for {tradingsymbol}!")
+                logger.debug(f"Found matching position for {tradingsymbol}!")
                 logger.debug(f"Net Quantity: {net_qty}")
                 break
             else:
-                logger.debug("✗ Position does not match criteria")
+                logger.debug("Position does not match criteria")
     else:
         logger.warning(f"No positions data available or error in API response: {positions_data}")
 
@@ -351,6 +355,7 @@ def place_order_api(data, auth):
     return res, response, orderid
 
 
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data, auth):
     AUTH_TOKEN = auth
 
@@ -362,9 +367,9 @@ def place_smartorder_api(data, auth):
     exchange = data.get("exchange")
     product = data.get("product")
     # Per-symbol lock: serialize smart orders per symbol
-    symbol_lock = _get_symbol_lock(symbol, exchange, product)
-
-    with symbol_lock:
+    with _get_symbol_lock(symbol, exchange, product) as symbol_lock:
+        if not symbol_lock:
+            return SymbolLocks.busy(symbol)
         position_size = int(data.get("position_size", "0"))
 
         # Get current open position for the symbol
@@ -429,12 +434,12 @@ def place_smartorder_api(data, auth):
             order_data["action"] = action
             order_data["quantity"] = str(quantity)
 
-            logger.info(f"Placing smart order: {order_data}")
+            logger.debug(f"Placing smart order: {order_data}")
             # Place the order
             res, response, orderid = place_order_api(order_data, auth)
             _invalidate_position_cache(AUTH_TOKEN)
             logger.debug(f"Smart order response: {response}")
-            logger.info(f"Smart order ID: {orderid}")
+            logger.debug(f"Smart order ID: {orderid}")
 
             return res, response, orderid
 
@@ -465,7 +470,7 @@ def close_all_positions(current_api_key, auth):
 
     if positions_response["status"] == "success":
         total_positions = len(positions_response["data"])
-        logger.info(f"Found {total_positions} positions")
+        logger.debug(f"Found {total_positions} positions")
 
         # Loop through each position to close
         for position in positions_response["data"]:
@@ -473,7 +478,7 @@ def close_all_positions(current_api_key, auth):
             net_qty = position.get("net_qty", position.get("netQty", "0"))
             # Skip if net quantity is zero
             if int(net_qty) == 0:
-                logger.info(f"Skipping position with zero quantity: {position.get('security_id')}")
+                logger.debug(f"Skipping position with zero quantity: {position.get('security_id')}")
                 continue
 
             # Determine action based on net quantity
@@ -490,13 +495,13 @@ def close_all_positions(current_api_key, auth):
             # rather than trying to look it up in our database
 
             # Print detailed position info
-            logger.info(
+            logger.debug(
                 f"Processing position: security_id={pos_security_id}, exchange={pos_exchange}, instrument={pos_instrument}, display_name={pos_display_name}, qty={net_qty}, action={action}"
             )
 
             # Skip if no security ID
             if not pos_security_id:
-                logger.info(f"Skipping position due to missing security_id: {position}")
+                logger.debug(f"Skipping position due to missing security_id: {position}")
                 failed_closes += 1
                 continue
 
@@ -531,7 +536,7 @@ def close_all_positions(current_api_key, auth):
                 "source": "M",
             }
 
-            logger.info(f"Placing Order: {order_payload}")
+            logger.debug(f"Placing Order: {order_payload}")
 
             # Place the order directly without transform
             response = get_api_response(
@@ -545,7 +550,7 @@ def close_all_positions(current_api_key, auth):
             logger.debug(f"Response from closing order: {response}")
 
             if response.get("status") == "success":
-                logger.info(
+                logger.debug(
                     f"Successfully closed position for {pos_security_id} ({pos_display_name})"
                 )
                 successful_closes += 1
@@ -577,7 +582,7 @@ def cancel_order(orderid, auth):
     for order in orders_list["data"]:
         if order["order_no"] == orderid:
             if order["status"] == "Pending":
-                logger.info(f"Cancelling order: {orderid}")
+                logger.debug(f"Cancelling order: {orderid}")
                 payload = json.dumps(
                     {
                         "order_no": orderid,
@@ -637,7 +642,7 @@ def modify_order(data, auth):
                     "message": f"Order {orderid} cannot be modified. Current status: {order['status']}",
                 }, 400
 
-            logger.info(f"Modifying order: {orderid}")
+            logger.debug(f"Modifying order: {orderid}")
 
             # Prepare modification payload
             payload = {
@@ -660,7 +665,7 @@ def modify_order(data, auth):
                 "group_id": order["group_id"],
             }
 
-            logger.info(f"Modification payload: {payload}")
+            logger.debug(f"Modification payload: {payload}")
 
             response = get_api_response(
                 endpoint="/orders/v1/modify/regular",
@@ -669,7 +674,7 @@ def modify_order(data, auth):
                 payload=json.dumps(payload),
             )
 
-            logger.info(f"Modification response: {response}")
+            logger.debug(f"Modification response: {response}")
 
             if response.get("status") == "success":
                 return {
@@ -697,7 +702,7 @@ def cancel_all_orders_api(data, auth):
     orders_to_cancel = [
         order for order in order_book_response.get("data", []) if order["status"] in ["Pending"]
     ]
-    logger.info(f"{orders_to_cancel}")
+    logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 

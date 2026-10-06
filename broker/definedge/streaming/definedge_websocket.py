@@ -4,14 +4,16 @@ Based on the pyintegrate library and DefinedGe WebSocket API documentation.
 """
 
 import json
-import logging
 import ssl
 import threading
 import time
+from collections import deque
 
 import websocket
 
-logger = logging.getLogger(__name__)
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class DefinedGeWebSocket:
@@ -63,7 +65,6 @@ class DefinedGeWebSocket:
         # Connection state
         self.connected = False
         self.authenticated = False
-        self.should_reconnect = True  # Control auto-reconnect
 
         # Callbacks
         self.on_connect = None
@@ -77,15 +78,34 @@ class DefinedGeWebSocket:
         self.subscriptions = {}
         self.subscription_lock = threading.Lock()
 
-        # Connection management
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 5
-        self.reconnect_delay = 5
-
-        # Heartbeat management
+        # Heartbeat management. API docs allow up to 50s between heartbeats;
+        # fleet norm is 30s (see flattrade) for faster silent-stall detection.
         self.heartbeat_thread = None
-        self.heartbeat_interval = 50  # 50 seconds as per API docs
+        self.heartbeat_interval = 30
+        self.heartbeat_timeout = 120  # close socket if no message received for this long
         self.heartbeat_running = False
+        self._last_message_time = None
+        self._last_message_lock = threading.Lock()
+
+        # Market-data silence watchdog (issue #2075). _last_message_time above
+        # is stamped by every inbound frame, heartbeat acks included, so a
+        # session that keeps acking while sending no ticks passes the stall
+        # check forever. Tick flow gets its own clock, armed only once data
+        # has been arriving over time - see _update_last_data_time.
+        self.data_silence_timeout = 180
+        self.data_arm_bucket = 30
+        self.data_arm_buckets = 3
+        self.data_arm_window = 300
+        self._last_data_message_time = None
+        self._data_watchdog_armed = False
+        self._data_bucket_starts = deque(maxlen=self.data_arm_buckets)
+
+        # WS-level ping keeps NAT/proxy paths alive between app heartbeats
+        self.ping_interval = 30
+        self.ping_timeout = 10
+
+        # Reconnection is owned exclusively by the adapter (single owner,
+        # see issue #1359) - this layer only reports close via on_disconnect.
 
     def _refresh_tokens(self):
         """Re-read fresh auth tokens from the DB via token_provider.
@@ -132,10 +152,15 @@ class DefinedGeWebSocket:
                 on_close=self._on_close,
             )
 
-            # Start WebSocket connection in a separate thread
+            # Start WebSocket connection in a separate thread.
+            # WS-level ping/pong detects dead connections between app heartbeats.
             self.ws_thread = threading.Thread(
                 target=self.ws.run_forever,
-                kwargs={"sslopt": {"cert_reqs": ssl.CERT_NONE} if not ssl_verify else {}},
+                kwargs={
+                    "sslopt": {"cert_reqs": ssl.CERT_NONE} if not ssl_verify else {},
+                    "ping_interval": self.ping_interval,
+                    "ping_timeout": self.ping_timeout,
+                },
             )
             self.ws_thread.daemon = True
             self.ws_thread.start()
@@ -160,11 +185,8 @@ class DefinedGeWebSocket:
             return False
 
     def disconnect(self):
-        """Disconnect from WebSocket and prevent reconnection"""
+        """Disconnect from WebSocket"""
         try:
-            # Disable auto-reconnect first
-            self.should_reconnect = False
-
             # Stop heartbeat
             self.heartbeat_running = False
             if self.heartbeat_thread and self.heartbeat_thread.is_alive():
@@ -177,7 +199,6 @@ class DefinedGeWebSocket:
             # Reset connection state
             self.connected = False
             self.authenticated = False
-            self.reconnect_attempts = 0
 
             # Clear subscriptions
             with self.subscription_lock:
@@ -191,7 +212,8 @@ class DefinedGeWebSocket:
         """WebSocket connection opened"""
         logger.info("DefinedGe WebSocket connection opened")
         self.connected = True
-        self.reconnect_attempts = 0
+        self._update_last_message_time()
+        self._reset_data_liveness()
 
         # Authenticate after connection
         self._authenticate()
@@ -208,27 +230,18 @@ class DefinedGeWebSocket:
         self.connected = False
         self.authenticated = False
 
+        # Stop the heartbeat for this dead connection; a fresh one starts on
+        # the next successful authenticate.
+        self.heartbeat_running = False
+
+        # Reconnection is owned by the adapter's on_disconnect handler - do
+        # NOT reconnect here as well, or two competing retry loops each spawn
+        # their own socket (issue #1359, dual reconnect).
         if self.on_disconnect:
             try:
                 self.on_disconnect(self, close_status_code, close_msg)
             except Exception as e:
                 logger.error(f"Error in on_disconnect callback: {e}")
-
-        # Only reconnect if should_reconnect is True (not manually disconnected)
-        if self.should_reconnect and self.reconnect_attempts < self.max_reconnect_attempts:
-            self.reconnect_attempts += 1
-            logger.info(f"Attempting to reconnect... (attempt {self.reconnect_attempts})")
-
-            def delayed_reconnect():
-                time.sleep(self.reconnect_delay)
-                if self.should_reconnect:
-                    # Re-read fresh token from DB before reconnecting
-                    self._refresh_tokens()
-                    self.connect()
-
-            threading.Thread(target=delayed_reconnect, daemon=True).start()
-        elif not self.should_reconnect:
-            logger.info("Auto-reconnect disabled - not attempting reconnection")
 
     def _on_error(self, ws, error):
         """WebSocket error occurred"""
@@ -240,8 +253,65 @@ class DefinedGeWebSocket:
             except Exception as e:
                 logger.error(f"Error in on_error callback: {e}")
 
+    def _update_last_message_time(self):
+        """Record the time of the last received message for stall detection"""
+        with self._last_message_lock:
+            self._last_message_time = time.time()
+
+    def _update_last_data_time(self):
+        """Record a market-data frame and arm the data-silence watchdog.
+
+        Called only from the tick and depth branches of _on_message, never for
+        a connect ack, a subscription ack or the heartbeat reply, so the clock
+        it keeps is the feed's rather than the socket's.
+
+        Arming asks that data arrived *spread over time*, not that a lot of it
+        arrived. Definedge answers every subscribe with a "tk"/"dk" snapshot,
+        so a session opened overnight receives one frame per subscribed scrip
+        within a second of connecting - fifty symbols is fifty frames. Any
+        rule counting frames would arm on that burst and then recycle the
+        socket every data_silence_timeout until the market opened.
+
+        Bucketing separates the two: a burst lands in one bucket (two if it
+        straddles a boundary), while a live feed keeps producing frames bucket
+        after bucket. data_arm_window stops stray after-hours ticks hours
+        apart from accumulating into a false arm.
+
+        Arming lasts only for this connection, so a market that closes while
+        the watchdog is armed costs one recycle and the replacement then sits
+        quiet.
+        """
+        now = time.time()
+        newly_armed = False
+
+        with self._last_message_lock:
+            self._last_data_message_time = now
+
+            if not self._data_watchdog_armed:
+                bucket_start = now - (now % self.data_arm_bucket)
+                if not self._data_bucket_starts or self._data_bucket_starts[-1] != bucket_start:
+                    self._data_bucket_starts.append(bucket_start)
+
+                if (
+                    len(self._data_bucket_starts) == self._data_bucket_starts.maxlen
+                    and now - self._data_bucket_starts[0] <= self.data_arm_window
+                ):
+                    self._data_watchdog_armed = True
+                    newly_armed = True
+
+        if newly_armed:
+            logger.info("Market data is flowing; watching for tick silence from here on")
+
+    def _reset_data_liveness(self):
+        """Clear the per-connection market-data liveness state."""
+        with self._last_message_lock:
+            self._last_data_message_time = None
+            self._data_watchdog_armed = False
+            self._data_bucket_starts.clear()
+
     def _on_message(self, ws, message):
         """Process incoming WebSocket message"""
+        self._update_last_message_time()
         try:
             data = json.loads(message)
             message_type = data.get("t", "")  # DefinEdge uses 't' for type
@@ -253,14 +323,18 @@ class DefinedGeWebSocket:
                 self._handle_subscription_ack(data)
                 # IMPORTANT: Also process as tick data to capture initial OHLC
                 self._handle_tick_data(data)
+                self._update_last_data_time()
             elif message_type == "tf":  # Touchline feed
                 self._handle_tick_data(data)
+                self._update_last_data_time()
             elif message_type == "dk":  # Depth acknowledgement
                 self._handle_depth_ack(data)
                 # IMPORTANT: Also process as depth data to capture initial OHLC
                 self._handle_depth_data(data)
+                self._update_last_data_time()
             elif message_type == "df":  # Depth feed
                 self._handle_depth_data(data)
+                self._update_last_data_time()
             elif message_type == "uk":  # Unsubscribe touchline acknowledgement
                 self._handle_unsubscribe_ack(data)
             elif message_type == "udk":  # Unsubscribe depth acknowledgement
@@ -379,19 +453,9 @@ class DefinedGeWebSocket:
         if has_ohlc_in_ack:
             logger.debug(f"OHLC provided in ACK for {exchange}|{token}")
         else:
-            # Check current time to see if market is open
-            import datetime
-
-            now = datetime.datetime.now()
-            market_open = now.replace(hour=9, minute=15, second=0)
-            market_close = now.replace(hour=15, minute=30, second=0)
-
-            if now < market_open or now > market_close:
-                logger.warning(
-                    f"Market closed - No OHLC expected (Current: {now.strftime('%H:%M')})"
-                )
-            else:
-                logger.warning(f"Market open but NO OHLC in ACK for {exchange}|{token}")
+            # Expected outside market hours and for illiquid scrips; the
+            # touchline feed backfills OHLC once trades occur
+            logger.debug(f"No OHLC in ACK for {exchange}|{token}")
 
         logger.debug(f"Full ACK message: {data}")
 
@@ -418,16 +482,50 @@ class DefinedGeWebSocket:
         logger.info("Heartbeat thread started")
 
     def _heartbeat_loop(self):
-        """Send heartbeat every 50 seconds to keep connection alive"""
+        """Send app heartbeat every 30s and detect silently-stalled connections"""
         while self.heartbeat_running and self.connected:
             try:
                 time.sleep(self.heartbeat_interval)
-                if self.connected and self.ws:
-                    heartbeat_msg = {"t": "h"}
-                    self.ws.send(json.dumps(heartbeat_msg))
-                    logger.debug("Heartbeat sent")
+                if not (self.heartbeat_running and self.connected and self.ws):
+                    break
+
+                heartbeat_msg = {"t": "h"}
+                self.ws.send(json.dumps(heartbeat_msg))
+                logger.debug("Heartbeat sent")
+
+                # Stall detection, on two clocks. heartbeat_timeout catches a
+                # socket that has gone quiet altogether; data_silence_timeout
+                # catches one that still answers heartbeats while delivering no
+                # market data. The second case used to be invisible, because the
+                # ack itself refreshed _last_message_time - the feed could stay
+                # dead for the rest of the session with the connection still
+                # reported healthy, and nothing that runs on ticks (stop losses,
+                # sandbox order triggers, Flow conditions) would fire. Issue
+                # #2075. Either way the socket is closed so the adapter's
+                # on_disconnect handler reconnects.
+                now = time.time()
+                with self._last_message_lock:
+                    last = self._last_message_time
+                    last_data = self._last_data_message_time
+                    armed = self._data_watchdog_armed
+
+                stall_reason = None
+                if last and (now - last) > self.heartbeat_timeout:
+                    stall_reason = f"no messages received for {self.heartbeat_timeout}s"
+                elif armed and last_data and (now - last_data) > self.data_silence_timeout:
+                    stall_reason = (
+                        f"no market data for {now - last_data:.0f}s while the session "
+                        "kept answering heartbeats"
+                    )
+
+                if stall_reason:
+                    logger.error(f"Closing stalled connection - {stall_reason}")
+                    if self.ws:
+                        self.ws.close()
+                    break
             except Exception as e:
                 logger.error(f"Error sending heartbeat: {e}")
+                break
 
     def subscribe(self, subscription_type, tokens):
         """Subscribe to market data using DefinEdge format"""

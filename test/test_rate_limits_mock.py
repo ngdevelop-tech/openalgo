@@ -44,11 +44,8 @@ class MockAPI:
             "/api/v1/quotes": env_values.get("API_RATE_LIMIT", "50 per second"),
             "/api/v1/depth": env_values.get("API_RATE_LIMIT", "50 per second"),
             "/api/v1/history": env_values.get("API_RATE_LIMIT", "50 per second"),
-            "/strategy/webhook/test": env_values.get("WEBHOOK_RATE_LIMIT", "100 per minute"),
             "/chartink/webhook/test": env_values.get("WEBHOOK_RATE_LIMIT", "100 per minute"),
-            "/strategy/new": env_values.get("STRATEGY_RATE_LIMIT", "200 per minute"),
-            "/strategy/delete": env_values.get("STRATEGY_RATE_LIMIT", "200 per minute"),
-            "/strategy/configure": env_values.get("STRATEGY_RATE_LIMIT", "200 per minute"),
+            "/chartink/new": env_values.get("STRATEGY_RATE_LIMIT", "200 per minute"),
         }
 
     def parse_rate_limit(self, limit_str):
@@ -110,12 +107,12 @@ def test_endpoint(api, endpoint, expected_limit, description):
 
         if status == 200:
             success_count += 1
-            print("✓", end="", flush=True)
+            print(".", end="", flush=True)
         elif status == 429:
             rate_limited_count += 1
-            print("⚠", end="", flush=True)
+            print("!", end="", flush=True)
         else:
-            print("✗", end="", flush=True)
+            print("x", end="", flush=True)
 
         # Small delay between requests
         if i < expected_limit - 1:
@@ -127,10 +124,10 @@ def test_endpoint(api, endpoint, expected_limit, description):
 
     # Verify rate limit was enforced
     if success_count == expected_limit and rate_limited_count == total_requests - expected_limit:
-        print(f"  ✅ Rate limit correctly enforced at {expected_limit} requests")
+        print(f"Rate limit correctly enforced at {expected_limit} requests")
         return True
     else:
-        print("  ❌ Rate limit not properly enforced")
+        print("Rate limit not properly enforced")
         return False
 
 
@@ -146,9 +143,9 @@ def test_rate_limit_reset(api, endpoint, limit):
     # This should be rate limited
     status, _ = api.make_request(endpoint)
     if status == 429:
-        print("✓ Rate limit enforced after reaching limit")
+        print("Rate limit enforced after reaching limit")
     else:
-        print("✗ Rate limit not enforced")
+        print("Rate limit not enforced")
         return False
 
     # Wait for rate limit to reset (1.1 seconds for per-second limits)
@@ -158,10 +155,10 @@ def test_rate_limit_reset(api, endpoint, limit):
     # This should succeed now
     status, _ = api.make_request(endpoint)
     if status == 200:
-        print("✅ Rate limit reset successfully")
+        print("Rate limit reset successfully")
         return True
     else:
-        print("❌ Rate limit did not reset")
+        print("Rate limit did not reset")
         return False
 
 
@@ -181,10 +178,10 @@ def test_multiple_clients(api, endpoint, limit):
     status2, _ = api.make_request(endpoint, client_ip="192.168.1.2")
 
     if status1 == 429 and status2 == 200:
-        print("✅ Different clients have separate rate limits")
+        print("Different clients have separate rate limits")
         return True
     else:
-        print("❌ Rate limits not properly separated by client")
+        print("Rate limits not properly separated by client")
         return False
 
 
@@ -213,9 +210,8 @@ def main():
         ("/api/v1/cancelorder", 10, "Order Cancellation API"),
         ("/api/v1/placesmartorder", 2, "Smart Order API"),
         ("/api/v1/quotes", 50, "Quotes API (General)"),
-        ("/strategy/webhook/test", 100, "Strategy Webhook API"),
         ("/chartink/webhook/test", 100, "ChartInk Webhook API"),
-        ("/strategy/new", 200, "Strategy Creation API"),
+        ("/chartink/new", 200, "ChartInk Strategy Creation API"),
     ]
 
     for endpoint, limit, description in tests:
@@ -233,15 +229,15 @@ def main():
     # Summary
     print("\n" + "=" * 60)
     if all_passed:
-        print("✅ All mock tests PASSED!")
+        print("All mock tests PASSED!")
         print("\nRate limiting is correctly configured:")
         print("- Order APIs: 10 requests/second")
         print("- Smart Order API: 2 requests/second")
         print("- General APIs: 50 requests/second")
         print("- Webhook APIs: 100 requests/minute")
-        print("- Strategy APIs: 200 requests/minute")
+        print("- ChartInk Strategy APIs: 200 requests/minute")
     else:
-        print("❌ Some tests FAILED!")
+        print("Some tests FAILED!")
     print("=" * 60)
 
     return 0 if all_passed else 1

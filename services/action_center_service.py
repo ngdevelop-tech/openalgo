@@ -1,7 +1,8 @@
 # services/action_center_service.py
 
 import json
-from typing import Any, Dict, List, Tuple
+from datetime import UTC, datetime
+from typing import Any
 
 from database.action_center_db import get_pending_orders
 from utils.logging import get_logger
@@ -10,10 +11,25 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _seconds_since(moment) -> float | None:
+    """Seconds from a stored UTC moment to now, or None when there is none.
+
+    Measured here rather than in the browser, so a page open outside IST, or on
+    a machine whose clock is off, reads the same age as the server. The column
+    is written as naive UTC; an aware value is converted first.
+    """
+    if not isinstance(moment, datetime):
+        return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return max(0.0, (now - moment).total_seconds())
+
+
 def parse_pending_order(pending_order) -> dict[str, Any]:
     """
     Parse a pending order object into a dictionary for display
-    Handles different order types: placeorder, smartorder, basketorder, splitorder, optionsorder
+    Handles all order types that can be queued for Action Center approval.
 
     Args:
         pending_order: PendingOrder database object
@@ -35,6 +51,9 @@ def parse_pending_order(pending_order) -> dict[str, Any]:
             # Timestamps
             "created_at_ist": pending_order.created_at_ist,
             "approved_at_ist": pending_order.approved_at_ist,
+            # How long ago it was approved, which is when its send began. The
+            # page tells a send still under way from one a restart cut off.
+            "approved_age_seconds": _seconds_since(getattr(pending_order, "approved_at", None)),
             "approved_by": pending_order.approved_by,
             "rejected_at_ist": pending_order.rejected_at_ist,
             "rejected_by": pending_order.rejected_by,
@@ -51,7 +70,25 @@ def parse_pending_order(pending_order) -> dict[str, Any]:
         }
 
         # Parse based on API type
-        if api_type == "optionsorder":
+        if api_type == "optionsmultiorder":
+            legs = order_data.get("legs", [])
+            actions = {str(leg.get("action", "")).upper() for leg in legs}
+            products = {str(leg.get("product", "MIS")).upper() for leg in legs}
+            price_types = {str(leg.get("pricetype", "MARKET")).upper() for leg in legs}
+            order_dict.update(
+                {
+                    "symbol": f"{order_data.get('underlying', '')} ({len(legs)} legs)",
+                    "exchange": order_data.get("exchange", ""),
+                    "action": actions.pop() if len(actions) == 1 else "MULTI",
+                    "quantity": sum(int(leg.get("quantity", 0) or 0) for leg in legs),
+                    "price": "Multiple",
+                    "trigger_price": "Multiple",
+                    "price_type": price_types.pop() if len(price_types) == 1 else "Multiple",
+                    "product_type": products.pop() if len(products) == 1 else "Multiple",
+                }
+            )
+
+        elif api_type == "optionsorder":
             # Options order format
             order_dict.update(
                 {
@@ -62,6 +99,27 @@ def parse_pending_order(pending_order) -> dict[str, Any]:
                     "price": order_data.get("price", "0"),
                     "trigger_price": order_data.get("trigger_price", "0"),
                     "price_type": order_data.get("pricetype", "MARKET"),
+                    "product_type": order_data.get("product", ""),
+                }
+            )
+
+        elif api_type == "placegttorder":
+            trigger_type = str(order_data.get("trigger_type", "")).upper()
+            trigger_price = order_data.get("trigger_price", 0)
+            if trigger_type == "OCO":
+                trigger_price = (
+                    f"{order_data.get('triggerprice_sl', 0)} / "
+                    f"{order_data.get('triggerprice_tg', 0)}"
+                )
+            order_dict.update(
+                {
+                    "symbol": order_data.get("symbol", ""),
+                    "exchange": order_data.get("exchange", ""),
+                    "action": order_data.get("action", ""),
+                    "quantity": order_data.get("quantity", ""),
+                    "price": order_data.get("price", "0"),
+                    "trigger_price": trigger_price,
+                    "price_type": order_data.get("pricetype", "LIMIT"),
                     "product_type": order_data.get("product", ""),
                 }
             )
@@ -180,6 +238,9 @@ def calculate_action_center_stats(orders_list: list[dict[str, Any]]) -> dict[str
         "total_smartorder": 0,
         "total_basketorder": 0,
         "total_splitorder": 0,
+        "total_optionsorder": 0,
+        "total_optionsmultiorder": 0,
+        "total_placegttorder": 0,
     }
 
     for order in orders_list:
@@ -208,6 +269,12 @@ def calculate_action_center_stats(orders_list: list[dict[str, Any]]) -> dict[str
             stats["total_basketorder"] += 1
         elif api_type == "splitorder":
             stats["total_splitorder"] += 1
+        elif api_type == "optionsorder":
+            stats["total_optionsorder"] += 1
+        elif api_type == "optionsmultiorder":
+            stats["total_optionsmultiorder"] += 1
+        elif api_type == "placegttorder":
+            stats["total_placegttorder"] += 1
 
     return stats
 

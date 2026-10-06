@@ -178,7 +178,7 @@ def test_depth(client, symbols):
             print("-" * 30)
 
             buy_depth = depth_data.get("buy", [])
-            for i, level in enumerate(buy_depth[:5]):
+            for _i, level in enumerate(buy_depth[:5]):
                 price = format_price(level.get("price", 0))
                 qty = level.get("quantity", 0)
                 orders = level.get("orders", 0)
@@ -190,7 +190,7 @@ def test_depth(client, symbols):
             print("-" * 30)
 
             sell_depth = depth_data.get("sell", [])
-            for i, level in enumerate(sell_depth[:5]):
+            for _i, level in enumerate(sell_depth[:5]):
                 price = format_price(level.get("price", 0))
                 qty = level.get("quantity", 0)
                 orders = level.get("orders", 0)
@@ -361,15 +361,15 @@ def test_mode_switching(client, symbols):
         data = client.get_market_data(symbol["symbol"], symbol["exchange"])
         if data:
             if mode == "LTP" and "ltp" in data:
-                print(f"  ✓ Received LTP data: {format_price(data['ltp'].get('value', 0))}")
+                print(f"Received LTP data: {format_price(data['ltp'].get('value', 0))}")
             elif mode == "Quote" and "quote" in data:
-                print("  ✓ Received Quote data: OHLC available")
+                print("Received Quote data: OHLC available")
             elif mode == "Depth" and "depth" in data:
                 buy_levels = len(data["depth"].get("buy", []))
                 sell_levels = len(data["depth"].get("sell", []))
-                print(f"  ✓ Received Depth data: {buy_levels} buy, {sell_levels} sell levels")
+                print(f"Received Depth data: {buy_levels} buy, {sell_levels} sell levels")
         else:
-            print(f"  ⚠ No data received for {mode}")
+            print(f"No data received for {mode}")
 
     # Clean up
     client.unsubscribe([symbol], modes[-1])
@@ -475,12 +475,13 @@ def main():
     print("Comprehensive testing of LTP, Quote, and Depth with subscription management")
 
     # Get API key from environment or use the one from test files
-    api_key = os.getenv(
-        "API_KEY", "7653f710c940cdf1d757b5a7d808a60f43bc7e9c0239065435861da2869ec0fc"
-    )
+    api_key = os.getenv("OPENALGO_API_KEY", "")
 
     if not api_key:
-        print(f"{Colors.RED}Error: No API key found. Set API_KEY in .env file{Colors.ENDC}")
+        print(
+            f"{Colors.RED}OPENALGO_API_KEY is required before running this manual script"
+            f"{Colors.ENDC}"
+        )
         return
 
     # Test service layer functions first

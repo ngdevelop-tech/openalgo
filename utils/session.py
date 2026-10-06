@@ -94,6 +94,86 @@ def is_session_valid():
     return True
 
 
+def _todays_rollover_boundary(now_ist=None):
+    """Return today's session-expiry boundary (default 03:00 IST) as a
+    timezone-aware IST datetime. Mirrors the boundary used by is_session_valid().
+
+    Accepts an existing IST snapshot so a caller that already read the clock
+    compares against the same instant its date was derived from, rather than
+    two reads that could straddle the boundary.
+    """
+    if now_ist is None:
+        now_ist = datetime.now(pytz.timezone("UTC")).astimezone(pytz.timezone("Asia/Kolkata"))
+    expiry_time = os.getenv("SESSION_EXPIRY_TIME", "03:00")
+    hour, minute = map(int, expiry_time.split(":"))
+    return now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def get_trading_session_date():
+    """Return the current trading session's date as an ISO string (IST).
+
+    A trading session runs from SESSION_EXPIRY_TIME (default 03:00 IST) to the
+    same time next day, matching the broker token rollover. Between midnight
+    and that boundary the session still belongs to the *previous* calendar
+    date, so anything bucketed "per trading day" must use this rather than
+    ``date.today()`` - which is also the server's local date and may not be IST
+    at all on a host outside India.
+    """
+    now_ist = datetime.now(pytz.timezone("UTC")).astimezone(pytz.timezone("Asia/Kolkata"))
+    boundary = _todays_rollover_boundary(now_ist)
+    if now_ist < boundary:
+        return (now_ist - timedelta(days=1)).date().isoformat()
+    return now_ist.date().isoformat()
+
+
+def _has_fresher_session(username, current_session_id=None):
+    """Return True if an active session for ``username`` (other than
+    ``current_session_id``) authenticated at or after today's rollover boundary.
+
+    A post-boundary active session means another device has already
+    re-established the single shared broker token after the daily ~3 AM expiry,
+    so a stale cookie crossing the boundary must NOT trigger the global token
+    revoke. See the multi-session audit (finding #1).
+    """
+    try:
+        from database.auth_db import get_active_sessions
+
+        boundary = _todays_rollover_boundary()
+        ist = pytz.timezone("Asia/Kolkata")
+        for sess in get_active_sessions(username):
+            if current_session_id and sess.get("session_id") == current_session_id:
+                continue
+            raw = sess.get("login_time")
+            if not raw:
+                continue
+            try:
+                login_dt = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            # SQLite returns naive datetimes (tz stripped on storage); the value
+            # is IST wall-clock, so localize it before comparing.
+            if login_dt.tzinfo is None:
+                login_dt = ist.localize(login_dt)
+            if login_dt >= boundary:
+                return True
+    except Exception as e:
+        logger.warning(f"Error checking for fresher sessions for {username}: {e}")
+    return False
+
+
+def has_login_this_trading_session(username) -> bool:
+    """Return True if ``username`` has an active session that authenticated at
+    or after today's rollover boundary (default 03:00 IST).
+
+    Unlike ``is_session_valid()``, this reads only the database and never
+    touches the Flask request-scoped ``session``, so background threads can ask
+    it. Used at boot to decide whether the stored broker token belongs to the
+    current trading session: Indian broker tokens die at the daily rollover, and
+    only a login after that boundary re-establishes one.
+    """
+    return _has_fresher_session(username)
+
+
 def revoke_user_tokens(revoke_db_tokens=True):
     """
     Revoke auth tokens for the current user when session expires.
@@ -109,15 +189,59 @@ def revoke_user_tokens(revoke_db_tokens=True):
     if "user" in session:
         username = session.get("user")
         try:
-            from database.auth_db import auth_cache, feed_token_cache, upsert_auth
+            from database.auth_db import invalidate_user_auth_cache, upsert_auth
 
-            # Clear cache entries first to prevent stale data access
-            cache_key_auth = f"auth-{username}"
-            cache_key_feed = f"feed-{username}"
-            if cache_key_auth in auth_cache:
-                del auth_cache[cache_key_auth]
-            if cache_key_feed in feed_token_cache:
-                del feed_token_cache[cache_key_feed]
+            # Clear cache entries first to prevent stale data access. One
+            # call that never raises: a membership test then a delete could
+            # lose the entry to another thread in between and skip the rest.
+            invalidate_user_auth_cache(username)
+
+            # Multi-device guard (audit #1): this is the daily-rollover auto-expiry
+            # of a STALE cookie. If another device has already re-authenticated
+            # AFTER today's boundary, the single shared broker token in the DB is
+            # fresh — not stale. Running the global teardown here would revoke that
+            # fresh token, tear down its WebSocket feed (the ZeroMQ invalidation
+            # below reaches the proxy and disconnects the adapter), and force-logout
+            # every device. Suppress it: drop only THIS device's session row and
+            # return, leaving the caller to clear just this cookie.
+            if revoke_db_tokens and _has_fresher_session(username, session.get("session_id")):
+                logger.info(
+                    f"Auto-expiry: a newer session for {username} is active past the "
+                    f"daily rollover — logging out only this stale device, preserving "
+                    f"the shared broker token and other devices"
+                )
+                current_sid = session.get("session_id")
+                if current_sid:
+                    try:
+                        from database.auth_db import remove_session
+                        remove_session(current_sid)
+                    except Exception as session_error:
+                        logger.warning(f"Error removing stale session row: {session_error}")
+                return
+
+            # Out-of-band token guard (issue #185): the shared broker token may
+            # have been (re)written AFTER today's boundary by /inject_token (NQE
+            # pushing the day's fresh Kite token) or a broker login. That path
+            # creates no session row, so _has_fresher_session cannot see it, and
+            # a stale cookie from yesterday would blank the fresh token seconds
+            # after it landed. Same remedy: drop only this device's session.
+            if revoke_db_tokens:
+                from database.auth_db import token_written_since
+
+                if token_written_since(_todays_rollover_boundary()):
+                    logger.info(
+                        f"Auto-expiry: broker token for {username} was refreshed after "
+                        f"the daily rollover — logging out only this stale device, "
+                        f"preserving the fresh broker token"
+                    )
+                    current_sid = session.get("session_id")
+                    if current_sid:
+                        try:
+                            from database.auth_db import remove_session
+                            remove_session(current_sid)
+                        except Exception as session_error:
+                            logger.warning(f"Error removing stale session row: {session_error}")
+                    return
 
             # Publish cache invalidation event via ZeroMQ for other processes
             # This notifies WebSocket proxy and other processes to clear their stale caches
@@ -144,14 +268,6 @@ def revoke_user_tokens(revoke_db_tokens=True):
                 clear_settings_cache()
             except Exception as cache_error:
                 logger.exception(f"Error clearing settings cache: {cache_error}")
-
-            # Clear strategy cache on logout/session expiry
-            try:
-                from database.strategy_db import clear_strategy_cache
-
-                clear_strategy_cache()
-            except Exception as cache_error:
-                logger.exception(f"Error clearing strategy cache: {cache_error}")
 
             # Clear telegram cache on logout/session expiry
             try:
@@ -214,8 +330,16 @@ def check_session_validity(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not is_session_valid():
-            # Revoke tokens before clearing session
-            revoke_user_tokens()
+            # Only revoke the DB broker token for a session that actually
+            # completed broker login and has now genuinely expired — matching
+            # the guard in app.py's global before_request (see #1419). Without
+            # this, a session still mid broker-connect (logged_in never set)
+            # trips revoke_user_tokens() on any protected-route hit, which
+            # discards a broker token injected out-of-band (e.g. NQE pushing a
+            # fresh Kite token) moments earlier — the user never leaves the
+            # "connect your broker" loop even after a fresh Kite relogin.
+            if session.get("logged_in"):
+                revoke_user_tokens()
             session.clear()
 
             # Check if this is an AJAX/fetch request
@@ -255,8 +379,12 @@ def invalidate_session_if_invalid(f):
     def decorated_function(*args, **kwargs):
         if not is_session_valid():
             logger.info("Invalid session detected - clearing session")
-            # Revoke tokens before clearing session
-            revoke_user_tokens()
+            # Same guard as check_session_validity — see #1419 / the OpenAlgo
+            # login-loop RCA (2026-08-22): only revoke the DB broker token for
+            # a session that actually completed broker login and has now
+            # genuinely expired, not one still mid broker-connect.
+            if session.get("logged_in"):
+                revoke_user_tokens()
             session.clear()
         return f(*args, **kwargs)
 

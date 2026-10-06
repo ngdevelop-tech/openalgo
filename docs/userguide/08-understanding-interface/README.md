@@ -10,7 +10,7 @@ OpenAlgo's interface is designed to be intuitive while providing powerful functi
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  🔷 OpenAlgo          [Search...]       🔔 Notifications    👤 Admin  ▾    │
+│ OpenAlgo          [Search...] Notifications Admin  ▾    │
 └─────────────────────────────────────────────────────────────────────────────┘
      │                       │                    │                │
      Logo                  Search            Alerts          Profile Menu
@@ -48,8 +48,7 @@ OpenAlgo's interface is designed to be intuitive while providing powerful functi
 │                         │
 │  STRATEGIES             │
 │  ├── Flow Builder       │
-│  ├── Python Strategy    │
-│  └── Strategy Manager   │
+│  └── Python Strategy    │
 │                         │
 │  MONITORING             │
 │  ├── PnL Tracker        │
@@ -182,7 +181,7 @@ Manage your API keys for external integrations:
 │                                                                              │
 │  Your API Key:                                                              │
 │  ┌────────────────────────────────────────────────────────────────────┐    │
-│  │  abc123def456ghi789jkl012mno345pqr678                  [Copy] [👁️]  │    │
+│  │  abc123def456ghi789jkl012mno345pqr678                  [Copy] [ ]  │    │
 │  └────────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
 │  Order Mode:  ◉ Auto    ○ Semi-Auto                                        │
@@ -298,7 +297,7 @@ Visual profit/loss tracking:
 │  └────────────┘ └────────────┘ └────────────┘ └────────────┘              │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  📈 P&L Chart                                                        │   │
+│  │ P&L Chart                                                        │   │
 │  │       ₹                                                              │   │
 │  │    4000│        ╭──────╮                                            │   │
 │  │    3000│    ╭───╯      ╰──╮                                         │   │
@@ -325,10 +324,10 @@ Visual profit/loss tracking:
 
 | Badge | Meaning |
 |-------|---------|
-| 🟢 | Active/Success/Connected |
-| 🟡 | Pending/Warning |
-| 🔴 | Error/Failed/Disconnected |
-| ⚪ | Inactive/Neutral |
+| | Active/Success/Connected |
+| | Pending/Warning |
+| | Error/Failed/Disconnected |
+| | Inactive/Neutral |
 
 ### Tooltips
 

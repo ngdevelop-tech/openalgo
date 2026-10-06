@@ -15,7 +15,6 @@ from datetime import date, datetime, time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
-from cachetools import TTLCache
 from sqlalchemy import BigInteger, Boolean, Column, Date, Index, Integer, String, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -23,6 +22,7 @@ from sqlalchemy.pool import NullPool
 
 from utils.constants import CRYPTO_EXCHANGES, EXCHANGE_CRYPTO
 from utils.logging import get_logger
+from utils.thread_safe_cache import MISSING, LockedTTLCache
 
 # IST Timezone
 IST = pytz.timezone("Asia/Kolkata")
@@ -30,8 +30,8 @@ IST = pytz.timezone("Asia/Kolkata")
 logger = get_logger(__name__)
 
 # Cache for market timings - 1 hour TTL
-_timings_cache = TTLCache(maxsize=500, ttl=3600)
-_holidays_cache = TTLCache(maxsize=50, ttl=3600)
+_timings_cache = LockedTTLCache(maxsize=500, ttl=3600)
+_holidays_cache = LockedTTLCache(maxsize=50, ttl=3600)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -57,8 +57,14 @@ HOLIDAY_TYPES = ["TRADING_HOLIDAY", "SETTLEMENT_HOLIDAY", "SPECIAL_SESSION"]
 DEFAULT_MARKET_TIMINGS = {
     "NSE": {"start_offset": 33300000, "end_offset": 55800000},  # 09:15 - 15:30
     "BSE": {"start_offset": 33300000, "end_offset": 55800000},  # 09:15 - 15:30
-    "NFO": {"start_offset": 33300000, "end_offset": 55800000},  # 09:15 - 15:30
-    "BFO": {"start_offset": 33300000, "end_offset": 55800000},  # 09:15 - 15:30
+    # F&O runs past the cash close. SEBI's Closing Auction Session (circular
+    # HO/47/11/11(3)2025-MRD-POD2/I/2765/2026, effective 2026-08-03) applies to
+    # the equity cash segment only: cash pauses continuous trading at 15:15 and
+    # its close is derived by auction, while the derivatives segment keeps
+    # trading to roughly 15:40. Cutting NFO/BFO off at 15:30 would make the last
+    # ten minutes of live F&O invisible to anything driven by these timings.
+    "NFO": {"start_offset": 33300000, "end_offset": 56400000},  # 09:15 - 15:40
+    "BFO": {"start_offset": 33300000, "end_offset": 56400000},  # 09:15 - 15:40
     "CDS": {"start_offset": 32400000, "end_offset": 61200000},  # 09:00 - 17:00
     "BCD": {"start_offset": 32400000, "end_offset": 61200000},  # 09:00 - 17:00
     "MCX": {"start_offset": 32400000, "end_offset": 86100000},  # 09:00 - 23:55
@@ -530,8 +536,12 @@ def get_holidays_by_year(year: int) -> list[dict[str, Any]]:
     cache_key = f"holidays_{year}"
 
     # Check cache first
-    if cache_key in _holidays_cache:
-        return _holidays_cache[cache_key]
+    cached = _holidays_cache.get(cache_key, MISSING)
+    if cached is not MISSING:
+        return cached
+    # Read before the query, so a write that commits while this
+    # read is in flight keeps its invalidation (see LockedTTLCache).
+    generation = _holidays_cache.generation
 
     try:
         holidays = Holiday.query.filter(Holiday.year == year).order_by(Holiday.holiday_date).all()
@@ -567,7 +577,7 @@ def get_holidays_by_year(year: int) -> list[dict[str, Any]]:
             )
 
         # Cache the result
-        _holidays_cache[cache_key] = result
+        _holidays_cache.fill(cache_key, result, generation)
         return result
 
     except Exception as e:
@@ -608,8 +618,12 @@ def get_market_timings_for_date(query_date: date) -> list[dict[str, Any]]:
     cache_key = f"timings_{query_date.isoformat()}"
 
     # Check cache first
-    if cache_key in _timings_cache:
-        return _timings_cache[cache_key]
+    cached = _timings_cache.get(cache_key, MISSING)
+    if cached is not MISSING:
+        return cached
+    # Read before the query, so a write that commits while this
+    # read is in flight keeps its invalidation (see LockedTTLCache).
+    generation = _timings_cache.generation
 
     try:
         # Calculate midnight timestamp for the date in IST
@@ -643,7 +657,7 @@ def get_market_timings_for_date(query_date: date) -> list[dict[str, Any]]:
             # For SPECIAL_SESSION (like Muhurat), return the special timings
             if holiday.holiday_type == "SPECIAL_SESSION":
                 result = list(open_with_timings.values())
-                _timings_cache[cache_key] = result
+                _timings_cache.fill(cache_key, result, generation)
                 return result
 
             # For SETTLEMENT_HOLIDAY, trading is open with normal hours
@@ -659,17 +673,17 @@ def get_market_timings_for_date(query_date: date) -> list[dict[str, Any]]:
                                 "end_time": midnight_epoch + timings["end_offset"],
                             }
                         )
-                _timings_cache[cache_key] = result
+                _timings_cache.fill(cache_key, result, generation)
                 return result
 
             # For regular TRADING_HOLIDAY, if all exchanges are closed, return empty
             if closed_exchanges == set(SUPPORTED_EXCHANGES) and not open_with_timings:
-                _timings_cache[cache_key] = []
+                _timings_cache.fill(cache_key, [], generation)
                 return []
 
             # Build result with open exchanges only (closed exchanges not included)
             result = list(open_with_timings.values())
-            _timings_cache[cache_key] = result
+            _timings_cache.fill(cache_key, result, generation)
             return result
 
         # No holiday entry found - on weekends only crypto trades.
@@ -687,7 +701,7 @@ def get_market_timings_for_date(query_date: date) -> list[dict[str, Any]]:
                             "end_time": midnight_epoch + timings["end_offset"],
                         }
                     )
-            _timings_cache[cache_key] = crypto_only
+            _timings_cache.fill(cache_key, crypto_only, generation)
             return crypto_only
 
         # Normal trading day - return timings for all exchanges from DB
@@ -703,7 +717,7 @@ def get_market_timings_for_date(query_date: date) -> list[dict[str, Any]]:
                     }
                 )
 
-        _timings_cache[cache_key] = result
+        _timings_cache.fill(cache_key, result, generation)
         return result
 
     except Exception as e:
@@ -729,9 +743,10 @@ def get_special_session(query_date: date, exchange: str) -> Optional[Dict[str, A
         return None  # Crypto has no special-session concept
 
     cache_key = f"special_{query_date.isoformat()}_{exch}"
-    if cache_key in _timings_cache:
-        cached = _timings_cache[cache_key]
+    cached = _timings_cache.get(cache_key, MISSING)
+    if cached is not MISSING:
         return cached if cached else None
+    generation = _timings_cache.generation
 
     try:
         holiday = (
@@ -740,7 +755,7 @@ def get_special_session(query_date: date, exchange: str) -> Optional[Dict[str, A
             .first()
         )
         if not holiday:
-            _timings_cache[cache_key] = None
+            _timings_cache.fill(cache_key, None, generation)
             return None
 
         ex_row = HolidayExchange.query.filter(
@@ -750,7 +765,7 @@ def get_special_session(query_date: date, exchange: str) -> Optional[Dict[str, A
         ).first()
 
         if not ex_row or ex_row.start_time is None or ex_row.end_time is None:
-            _timings_cache[cache_key] = None
+            _timings_cache.fill(cache_key, None, generation)
             return None
 
         result = {
@@ -758,7 +773,7 @@ def get_special_session(query_date: date, exchange: str) -> Optional[Dict[str, A
             "end_ms": int(ex_row.end_time),
             "description": holiday.description,
         }
-        _timings_cache[cache_key] = result
+        _timings_cache.fill(cache_key, result, generation)
         return result
     except Exception as e:
         logger.debug(f"get_special_session failed for {query_date} {exch}: {e}")
@@ -788,9 +803,10 @@ def get_holiday_exchange_window(
         return None
 
     cache_key = f"holopen_{query_date.isoformat()}_{exch}"
-    if cache_key in _timings_cache:
-        cached = _timings_cache[cache_key]
+    cached = _timings_cache.get(cache_key, MISSING)
+    if cached is not MISSING:
         return cached if cached else None
+    generation = _timings_cache.generation
 
     try:
         holiday = (
@@ -799,7 +815,7 @@ def get_holiday_exchange_window(
             .first()
         )
         if not holiday:
-            _timings_cache[cache_key] = None
+            _timings_cache.fill(cache_key, None, generation)
             return None
 
         ex_row = HolidayExchange.query.filter(
@@ -809,11 +825,11 @@ def get_holiday_exchange_window(
         ).first()
 
         if not ex_row or ex_row.start_time is None or ex_row.end_time is None:
-            _timings_cache[cache_key] = None
+            _timings_cache.fill(cache_key, None, generation)
             return None
 
         result = {"start_ms": int(ex_row.start_time), "end_ms": int(ex_row.end_time)}
-        _timings_cache[cache_key] = result
+        _timings_cache.fill(cache_key, result, generation)
         return result
     except Exception as e:
         logger.debug(f"get_holiday_exchange_window failed for {query_date} {exch}: {e}")
@@ -1019,6 +1035,46 @@ def ensure_market_calendar_tables_exists():
     check_and_update_holidays()
     # Seed market timings if not present
     seed_market_timings()
+    migrate_fo_close_for_cas()
+
+
+#: Exchanges whose close moved with the Closing Auction Session, and the value
+#: they held before it. Only a row still carrying the old close is updated, so
+#: an admin who has set their own timing is not overwritten.
+CAS_CLOSE_MIGRATION = {
+    "NFO": {"old_end": 55800000, "new_end": 56400000},
+    "BFO": {"old_end": 55800000, "new_end": 56400000},
+}
+
+
+def migrate_fo_close_for_cas():
+    """Move the NFO/BFO close from 15:30 to 15:40 on existing installs.
+
+    seed_market_timings only runs when the table is empty, so every existing
+    installation would keep the pre-CAS close indefinitely. Guarded on the old
+    value: a row an admin has already customised is left alone rather than
+    being reset to a default they did not ask for.
+    """
+    try:
+        changed = 0
+        for exchange, spec in CAS_CLOSE_MIGRATION.items():
+            row = MarketTiming.query.filter_by(exchange_code=exchange).first()
+            if row is None or int(row.end_offset or 0) != spec["old_end"]:
+                continue
+            row.end_offset = spec["new_end"]
+            hours = spec["new_end"] // 3600000
+            mins = (spec["new_end"] % 3600000) // 60000
+            row.end_time = f"{hours:02d}:{mins:02d}"
+            changed += 1
+        if changed:
+            db_session.commit()
+            logger.info(
+                f"Market Calendar DB: moved the close to 15:40 for {changed} "
+                "F&O exchange(s) following SEBI's Closing Auction Session"
+            )
+    except Exception as e:
+        db_session.rollback()
+        logger.exception(f"Market Calendar DB: could not migrate the F&O close: {e}")
 
 
 def seed_market_timings():

@@ -3,6 +3,9 @@ import os
 import urllib.parse
 from hashlib import sha256
 
+import httpx
+
+from broker.definedge.api.baseurl import SESSION_URL
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
@@ -70,9 +73,7 @@ def login_step1(api_token=None, api_secret=None):
 
         headers = {"api_secret": api_secret}
 
-        url = (
-            f"https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/login/{api_token}"
-        )
+        url = f"{SESSION_URL}/login/{api_token}"
 
         response = client.get(url, headers=headers)
         response.raise_for_status()  # Raise exception for 4XX/5XX responses
@@ -85,6 +86,9 @@ def login_step1(api_token=None, api_secret=None):
 
         return response_data
 
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Step 1 error: HTTP {e.response.status_code} from {SESSION_URL}/login")
+        return None
     except Exception as e:
         logger.error(f"Step 1 error: {e}")
         return None
@@ -104,7 +108,7 @@ def login_step2(otp_token, otp, api_secret):
 
         headers = {"Content-Type": "application/json"}
 
-        url = "https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/token"
+        url = f"{SESSION_URL}/token"
 
         response = client.post(url, json=payload, headers=headers)
         response.raise_for_status()  # Raise exception for 4XX/5XX responses

@@ -61,7 +61,7 @@ headless Chromium over the Chrome DevTools Protocol. When you call
 If Chromium isn't on the system, the subprocess spawn fails and
 `fig.to_image()` raises — the generator catches it, logs
 `Error generating intraday chart: ...`, and the bot replies with
-`❌ Failed to generate charts for <symbol>`.
+` Failed to generate charts for <symbol>`.
 
 ### Confirming Chromium is present
 
@@ -380,7 +380,9 @@ abstraction.
 
 ---
 
-## 5. Legacy files: `telegram_bot_service_fixed.py`, `telegram_bot_service_v2.py`
+## 5. Legacy files: `telegram_bot_service_fixed.py`, `telegram_bot_service_v2.py` (deleted)
+
+Both files have been deleted. The section below is kept as the record of why.
 
 Both of these exist in `services/` and both contain the **unfixed** pattern:
 
@@ -409,7 +411,7 @@ without applying the same `_render_plotly_png` pattern.
 
 ## 6. Operator troubleshooting checklist
 
-When `/chart RELIANCE` returns `❌ Failed to generate charts for RELIANCE`:
+When `/chart RELIANCE` returns ` Failed to generate charts for RELIANCE`:
 
 1. **Container/host logs first.**
    ```bash
@@ -485,8 +487,6 @@ When `/chart RELIANCE` returns `❌ Failed to generate charts for RELIANCE`:
 | `install/install-multi.sh` | Multi-tenant bare-metal installer; Chromium install block after main `apt-get install` |
 | `install/update.sh` | In-place updater; does **not** touch system packages — operators must install Chromium manually when upgrading an old install |
 | `pyproject.toml` | Pins `kaleido==1.2.0` and `plotly==6.6.0` |
-| `services/telegram_bot_service_fixed.py` | Legacy backup — unused, contains unfixed pattern |
-| `services/telegram_bot_service_v2.py` | Legacy backup — unused, contains unfixed pattern |
 
 ---
 

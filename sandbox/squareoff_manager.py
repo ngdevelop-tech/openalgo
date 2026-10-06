@@ -12,6 +12,7 @@ Features:
 
 import os
 import sys
+import threading
 from datetime import datetime, time
 from decimal import Decimal
 
@@ -23,8 +24,22 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database.sandbox_db import SandboxPositions, db_session, get_config
 from sandbox.position_manager import PositionManager
 from utils.logging import get_logger
+from utils.runtime import gthread_active
 
 logger = get_logger(__name__)
+
+#: Longest a sweep waits for one already running before it gives up, under the
+#: gthread worker only. The backup job runs every minute, so a sweep skipped
+#: here is retried within one.
+SWEEP_WAIT_SECONDS = 120.0
+
+#: One square-off sweep at a time in this process. The exchange's own job and
+#: the one-minute backup both fire at the square-off minute on two scheduler
+#: threads (max_instances is per job, not per function), and two sweeps side
+#: by side each loaded the same MIS positions and each sent a closing order.
+#: Taken only by scheduler threads, which are green under eventlet, so a
+#: plain lock is the right kind.
+_sweep_lock = threading.Lock()
 
 
 class SquareOffManager:
@@ -58,13 +73,54 @@ class SquareOffManager:
         """
         Check if it's time to square-off positions and execute
         Should be called frequently (e.g., every minute)
+
+        Sweeps run one after another, never side by side: a sweep that finds
+        another running waits for it and then works from what that one left,
+        so each due position is closed by exactly one of them.
         """
+        # Bounded under gthread only; elsewhere a sweep waits as long as the
+        # one before it takes, so it is never skipped where it used to run.
+        wait = SWEEP_WAIT_SECONDS if gthread_active() else -1
+        if not _sweep_lock.acquire(timeout=wait):
+            logger.warning(
+                "Square-off sweep skipped: the previous sweep is still running; "
+                "the next scheduled check retries"
+            )
+            return
+        try:
+            self._check_and_square_off()
+        finally:
+            _sweep_lock.release()
+
+    def _check_and_square_off(self):
         try:
             now = datetime.now(self.ist)
             current_time = now.time()
 
             # Step 1: Cancel all open MIS orders past square-off time
             cancelled_count = self._cancel_open_mis_orders(current_time)
+
+            # Step 1b: Cancel open orders on expired F&O contracts. Expired
+            # POSITIONS are settled by position_manager, but an unfilled
+            # LIMIT/SL order on an expired contract had no reaper: it sat
+            # "open" forever, kept its margin blocked, and its symbol -- gone
+            # from the master contract after the daily refresh -- made the
+            # WebSocket engine log token-lookup errors on every boot.
+            cancelled_count += self._cancel_expired_contract_orders()
+
+            # Step 1c: Settle positions on expired F&O contracts. Runs the
+            # same cleanup the boot catch-up uses, so expiry settlement is
+            # proactive (every minute via the backup job) instead of waiting
+            # for someone to open the positionbook. Cheap when nothing has
+            # expired: one query, no matches, return. Timing (expiry-day
+            # close vs next day) and option settlement price are governed by
+            # the expiry_settlement_timing / option_expiry_settlement configs.
+            try:
+                from sandbox.position_manager import cleanup_expired_contracts
+
+                cleanup_expired_contracts()
+            except Exception as e:
+                logger.exception(f"Error settling expired positions: {e}")
 
             # Step 2: Get all open MIS positions (quantity != 0)
             mis_positions = (
@@ -120,6 +176,63 @@ class SquareOffManager:
         except Exception as e:
             logger.exception(f"Error checking square-off conditions: {e}")
 
+    def _cancel_expired_contract_orders(self):
+        """Cancel open orders whose F&O contract has expired.
+
+        Mirrors _check_and_close_expired_positions (which settles expired
+        positions) for the order book. Cancelling via OrderManager.cancel_order
+        releases the blocked margin, exactly like the MIS auto-cancel above.
+        Equity orders (no parseable expiry) are never touched.
+
+        Returns the number of orders cancelled.
+        """
+        cancelled_count = 0
+        try:
+            from database.sandbox_db import SandboxOrders
+            from sandbox.order_manager import OrderManager
+            from sandbox.position_manager import (
+                get_contract_expiry,
+                is_contract_expired_now,
+            )
+
+            open_orders = SandboxOrders.query.filter(
+                SandboxOrders.order_status.in_(["open", "trigger pending"])
+            ).all()
+
+            for order in open_orders:
+                expiry_date = get_contract_expiry(order.symbol, order.exchange)
+                # Same timing rule as position settlement: with the default
+                # expiry_day_close config an order dies at the closing bell of
+                # expiry day, not the following midnight.
+                if not is_contract_expired_now(expiry_date, order.exchange):
+                    continue
+
+                try:
+                    order_manager = OrderManager(order.user_id)
+                    success, response, status_code = order_manager.cancel_order(order.orderid)
+                    if success:
+                        logger.info(
+                            f"Auto-cancelled order {order.orderid} for {order.symbol}: "
+                            f"contract expired {expiry_date}"
+                        )
+                        cancelled_count += 1
+                    else:
+                        logger.error(
+                            f"Failed to cancel expired-contract order {order.orderid}: "
+                            f"{response.get('message', 'Unknown error')}"
+                        )
+                except Exception as e:
+                    logger.exception(
+                        f"Error cancelling expired-contract order {order.orderid}: {e}"
+                    )
+
+            if cancelled_count > 0:
+                logger.info(f"Auto-cancelled {cancelled_count} open orders on expired contracts")
+        except Exception as e:
+            logger.exception(f"Error in _cancel_expired_contract_orders: {e}")
+
+        return cancelled_count
+
     def _cancel_open_mis_orders(self, current_time):
         """Cancel all open MIS orders past their exchange's square-off time.
 
@@ -131,8 +244,12 @@ class SquareOffManager:
             from database.sandbox_db import SandboxOrders
             from sandbox.order_manager import OrderManager
 
-            # Get all open MIS orders
-            open_orders = SandboxOrders.query.filter_by(product="MIS", order_status="open").all()
+            # Get all open MIS orders - "open" and "trigger pending" (SL/SL-M
+            # still resting in the Stop-Loss book) both need square-off
+            open_orders = SandboxOrders.query.filter(
+                SandboxOrders.product == "MIS",
+                SandboxOrders.order_status.in_(["open", "trigger pending"]),
+            ).all()
 
             if not open_orders:
                 return 0
@@ -206,6 +323,11 @@ class SquareOffManager:
 
     def force_square_off_all_mis(self):
         """Force square-off all MIS positions immediately"""
+        # Same one-at-a-time rule as the scheduled sweep it would otherwise race.
+        with _sweep_lock:
+            return self._force_square_off_all_mis()
+
+    def _force_square_off_all_mis(self):
         try:
             mis_positions = (
                 SandboxPositions.query.filter_by(product="MIS")

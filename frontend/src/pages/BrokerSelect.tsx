@@ -2,6 +2,7 @@ import { BookOpen, ExternalLink, Info, Loader2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { BrokerAuthSignOut } from '@/components/auth/BrokerAuthSignOut'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -20,6 +21,7 @@ const allBrokers = [
   { id: 'fivepaisaxts', name: '5 Paisa (XTS)', authType: 'totp' },
   { id: 'aliceblue', name: 'Alice Blue', authType: 'totp' },
   { id: 'angel', name: 'Angel One', authType: 'totp' },
+  { id: 'arrow', name: 'Arrow', authType: 'oauth' },
   { id: 'compositedge', name: 'CompositEdge', authType: 'oauth' },
   { id: 'dhan', name: 'Dhan', authType: 'oauth' },
   { id: 'deltaexchange', name: 'Delta Exchange', authType: 'totp' },
@@ -31,6 +33,8 @@ const allBrokers = [
   { id: 'motilal', name: 'Motilal Oswal', authType: 'totp' },
   { id: 'fyers', name: 'Fyers', authType: 'oauth' },
   { id: 'groww', name: 'Groww', authType: 'totp' },
+  { id: 'hdfcsecurities', name: 'HDFC Securities', authType: 'oauth' },
+  { id: 'hdfcsky', name: 'HDFC Sky', authType: 'oauth' },
   { id: 'ibulls', name: 'Ibulls', authType: 'totp' },
   { id: 'iifl', name: 'IIFL', authType: 'totp' },
   { id: 'iiflcapital', name: 'IIFL Capital', authType: 'oauth' },
@@ -44,6 +48,7 @@ const allBrokers = [
   { id: 'samco', name: 'Samco', authType: 'totp' },
   { id: 'shoonya', name: 'Shoonya', authType: 'totp' },
   { id: 'tradejini', name: 'Tradejini', authType: 'totp' },
+  { id: 'tradesmart', name: 'TradeSmart', authType: 'oauth' },
   { id: 'upstox', name: 'Upstox', authType: 'oauth' },
   { id: 'wisdom', name: 'Wisdom Capital', authType: 'totp' },
   { id: 'zebu', name: 'Zebu', authType: 'totp' },
@@ -192,6 +197,7 @@ export default function BrokerSelect() {
       case 'rmoney':
       case 'shoonya':
       case 'tradejini':
+      case 'tradesmart':
       case 'wisdom':
       case 'zebu':
         // Brokers using callback route (form-based or redirect-based)
@@ -228,6 +234,24 @@ export default function BrokerSelect() {
 
       case 'zerodha':
         loginUrl = `https://kite.trade/connect/login?api_key=${broker_api_key}`
+        break
+
+      case 'arrow':
+        // Arrow hosted login; redirects back to /arrow/callback with request-token.
+        loginUrl = `https://app.arrow.trade/app/login?appID=${broker_api_key}`
+        break
+
+      case 'hdfcsecurities':
+        // HDFC Securities InvestRight hosted login (credentials + 2FA +
+        // consent); redirects back to the app's registered callback with a
+        // request token.
+        loginUrl = `https://developer.hdfcsec.com/oapi/v1/login?api_key=${broker_api_key}`
+        break
+
+      case 'hdfcsky':
+        // HDFC Sky hosted login (credentials + 2FA + consent); redirects back
+        // to the app's registered callback with a request token.
+        loginUrl = `https://developer.hdfcsky.com/oapi/v1/login?api_key=${broker_api_key}`
         break
 
       case 'paytm':
@@ -334,6 +358,10 @@ export default function BrokerSelect() {
                   )}
                 </Button>
               </form>
+
+              <div className="mt-6 text-center text-sm">
+                <BrokerAuthSignOut />
+              </div>
             </CardContent>
           </Card>
 
