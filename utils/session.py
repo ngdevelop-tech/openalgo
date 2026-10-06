@@ -219,6 +219,30 @@ def revoke_user_tokens(revoke_db_tokens=True):
                         logger.warning(f"Error removing stale session row: {session_error}")
                 return
 
+            # Out-of-band token guard (issue #185): the shared broker token may
+            # have been (re)written AFTER today's boundary by /inject_token (NQE
+            # pushing the day's fresh Kite token) or a broker login. That path
+            # creates no session row, so _has_fresher_session cannot see it, and
+            # a stale cookie from yesterday would blank the fresh token seconds
+            # after it landed. Same remedy: drop only this device's session.
+            if revoke_db_tokens:
+                from database.auth_db import token_written_since
+
+                if token_written_since(_todays_rollover_boundary()):
+                    logger.info(
+                        f"Auto-expiry: broker token for {username} was refreshed after "
+                        f"the daily rollover — logging out only this stale device, "
+                        f"preserving the fresh broker token"
+                    )
+                    current_sid = session.get("session_id")
+                    if current_sid:
+                        try:
+                            from database.auth_db import remove_session
+                            remove_session(current_sid)
+                        except Exception as session_error:
+                            logger.warning(f"Error removing stale session row: {session_error}")
+                    return
+
             # Publish cache invalidation event via ZeroMQ for other processes
             # This notifies WebSocket proxy and other processes to clear their stale caches
             try:

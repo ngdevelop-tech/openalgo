@@ -2,7 +2,9 @@
 
 import base64
 import os
+import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -599,6 +601,34 @@ def decrypt_token(encrypted_token):
         return None
 
 
+# Wall-clock (UTC) of the most recent NON-revoke write of the shared broker auth
+# row in THIS process: a real broker login, a multi-session resume, or an
+# out-of-band /inject_token push (e.g. NQE forwarding the day's fresh Kite
+# token). In-memory on purpose — no schema change; after a restart it is unset
+# and callers fall back to the old behaviour. See token_written_since().
+_last_fresh_token_write = None
+_fresh_token_write_lock = threading.Lock()
+
+
+def _mark_fresh_token_write(when=None):
+    global _last_fresh_token_write
+    with _fresh_token_write_lock:
+        _last_fresh_token_write = when or datetime.now(timezone.utc)
+
+
+def token_written_since(boundary):
+    """True if the shared broker token was (re)written, non-revoked, at or after
+    ``boundary`` (a timezone-aware datetime) by this process.
+
+    The daily auto-expiry of a stale browser cookie uses this to avoid revoking a
+    token that was refreshed after the rollover boundary — including one pushed via
+    /inject_token, which creates no session row for the multi-device guard to see.
+    """
+    with _fresh_token_write_lock:
+        written = _last_fresh_token_write
+    return written is not None and written >= boundary
+
+
 def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=False):
     """Store encrypted auth token and feed token if provided.
 
@@ -654,6 +684,8 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
         )
         db_session.add(auth_obj)
     db_session.commit()
+    if not revoke:
+        _mark_fresh_token_write()
 
     # CRITICAL: Clear ENTIRE auth_cache on token update to prevent stale token issues
     # This is necessary because get_auth_token_broker() uses a different cache key format

@@ -123,3 +123,86 @@ def test_check_session_validity_still_revokes_a_genuinely_expired_session(monkey
 
     assert resp.status_code == 302
     assert len(revoke_calls) == 1
+
+
+@pytest.fixture(autouse=True)
+def _reset_fresh_token_marker():
+    auth_db._last_fresh_token_write = None
+    yield
+    auth_db._last_fresh_token_write = None
+
+
+def _expired_logged_in_client(app):
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["user"] = "rajandran"
+        sess["logged_in"] = True
+        sess["broker"] = "zerodha"
+        sess["login_time"] = "2020-01-01T00:00:00+05:30"
+    return client
+
+
+def test_stale_session_does_not_revoke_token_injected_after_rollover(monkeypatch):
+    """Issue #185: NQE pushes the day's fresh Kite token via /inject_token, then a
+    stale browser cookie from yesterday crosses the 03:00 boundary seconds later.
+    The auto-expiry must drop only that stale session, not blank the fresh token.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    app = _make_test_app()
+    revoke_calls = []
+    _patch_revoke_side_effects(monkeypatch, revoke_calls)
+    monkeypatch.setattr(session_utils, "_has_fresher_session", lambda *a, **k: False)
+    auth_db._mark_fresh_token_write(datetime.now(timezone.utc) + timedelta(seconds=1))
+
+    resp = _expired_logged_in_client(app).get("/protected")
+
+    assert resp.status_code == 302
+    assert revoke_calls == []
+
+
+def test_stale_session_still_revokes_when_token_not_refreshed_since_rollover(monkeypatch):
+    """No fresh write this trading session (marker unset, e.g. after a restart, or
+    older than the boundary): a genuinely expired session still revokes."""
+    from datetime import datetime, timedelta, timezone
+
+    app = _make_test_app()
+    revoke_calls = []
+    _patch_revoke_side_effects(monkeypatch, revoke_calls)
+    monkeypatch.setattr(session_utils, "_has_fresher_session", lambda *a, **k: False)
+
+    assert _expired_logged_in_client(app).get("/protected").status_code == 302
+    assert len(revoke_calls) == 1
+
+    revoke_calls.clear()
+    auth_db._mark_fresh_token_write(datetime.now(timezone.utc) - timedelta(days=2))
+    assert _expired_logged_in_client(app).get("/protected").status_code == 302
+    assert len(revoke_calls) == 1
+
+
+def test_explicit_non_expiry_revoke_is_unaffected_by_marker(monkeypatch):
+    """revoke_db_tokens=False path (cache-only) never touches the DB either way;
+    and the marker guard only applies to the revoking auto-expiry path."""
+    from datetime import datetime, timezone
+
+    app = Flask(__name__)
+    app.secret_key = "test-secret"
+    revoke_calls = []
+    _patch_revoke_side_effects(monkeypatch, revoke_calls)
+    auth_db._mark_fresh_token_write(datetime.now(timezone.utc))
+
+    with app.test_request_context("/"):
+        session["user"] = "rajandran"
+        session_utils.revoke_user_tokens(revoke_db_tokens=False)
+
+    assert revoke_calls == []
+
+
+def test_token_written_since_semantics():
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    assert auth_db.token_written_since(now) is False  # unset
+    auth_db._mark_fresh_token_write(now)
+    assert auth_db.token_written_since(now - timedelta(hours=1)) is True
+    assert auth_db.token_written_since(now + timedelta(hours=1)) is False

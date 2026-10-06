@@ -112,3 +112,18 @@ def test_revoke_always_tears_down(fresh_db, spy_teardown):
 
     assert spy_teardown["publish"] == ["rajandran"]
     assert spy_teardown["cleanup"] == [("rajandran", "shoonya")]
+
+
+def test_fresh_token_marker_set_on_write_not_on_revoke(fresh_db, spy_teardown):
+    """Issue #185: a non-revoke write (login / resume / inject_token) stamps the
+    in-memory freshness marker; a revoke write must not."""
+    from datetime import datetime, timedelta, timezone
+
+    auth_db._last_fresh_token_write = None
+    before = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    auth_db.upsert_auth("rajandran", "", "", revoke=True)
+    assert auth_db.token_written_since(before) is False
+
+    auth_db.upsert_auth("rajandran", "tok-1", "zerodha")
+    assert auth_db.token_written_since(before) is True
